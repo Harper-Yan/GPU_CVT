@@ -893,8 +893,9 @@ void Query( int stream_id, int K, int* __restrict__ cell_bin_counts,
     if( query_sequence_id >= n_stream ) { return; }
     
     int const qp = arr_idx_arr[stream_id][query_sequence_id] ; //Local to cell
-    int const global_qp = sorted_global_idx[cell_psum[stream_id] + qp]; 
-    if(frozen[global_qp]) { return; }
+    int const global_qp = sorted_global_idx[cell_psum[stream_id] + qp];
+    // Skip query for frozen site (no work, no result write; caller keeps prev K-NN for frozen).
+    if (frozen[global_qp]) { return; }
 
     idx_t best_point_id[ROUNDS];
     float best_distance[ROUNDS];
@@ -993,10 +994,153 @@ void Query( int stream_id, int K, int* __restrict__ cell_bin_counts,
     }
 }
 
+/**
+ * Query kernel when using a separate query point array (query_points).
+ * Query points do not need to be in the candidate dataset.
+ * global_query_id is used for result indexing; q_xyz comes from query_points.
+ */
+template < std::size_t ROUNDS >
+__global__
+__launch_bounds__(32, 2)
+void QueryWithPoints( int stream_id, int K, int* __restrict__ query_cell_counts,
+    const int* __restrict__ cell_bin_counts,
+    const float* __restrict__ query_points,
+    const int* __restrict__ query_cell_psum,
+    const idx_t* __restrict__ query_cell_list,
+    float* __restrict__ solutions_distances,
+    idx_t* __restrict__ solutions_knn,
+    idx_t** __restrict__ arr_idx_arr,
+    idx_t* __restrict__ sorted_global_idx,
+    float** __restrict__ arr_x_arr,
+    float** __restrict__ arr_y_arr,
+    float** __restrict__ arr_z_arr,
+    float** __restrict__ data,
+    idx_t** __restrict__ dH,
+    idx_t** __restrict__ dH_psum,
+    const int* __restrict__ cell_psum,
+    float** __restrict__ D_arr,
+    idx_t** __restrict__ iD_arr,
+    float** __restrict__ dD_arr,
+    float* __restrict__ cell_maxs,
+    float* __restrict__ cell_mins,
+    int* __restrict__ hubs_scanned,
+    int* __restrict__ pointsScanned,
+    int num_cells,
+    const unsigned char* __restrict__ frozen
+)
+{
+    int const lane_id           = threadIdx.x;
+    int const query_id_in_block = threadIdx.y;
+    int const queries_per_block = blockDim.y;
+    int const query_sequence_id = blockIdx.x * queries_per_block + query_id_in_block;
+
+    int n_stream = query_cell_counts[stream_id];
+
+    if( query_sequence_id >= n_stream ) { return; }
+
+    idx_t const global_query_id = query_cell_list[query_cell_psum[stream_id] + query_sequence_id];
+    // Skip query for frozen site (caller keeps prev K-NN for frozen).
+    if (frozen && frozen[global_query_id]) { return; }
+
+    float q_xyz[3] = {
+        query_points[global_query_id * 3 + 0],
+        query_points[global_query_id * 3 + 1],
+        query_points[global_query_id * 3 + 2]
+    };
+
+    idx_t best_point_id[ROUNDS];
+    float best_distance[ROUNDS];
+
+    for (int i = 0; i < ROUNDS; i++) {
+        best_point_id[i] = -1;
+        best_distance[i] = FLT_MAX;
+    }
+
+    idx_t const lane_K  = (K - 1) % warp_size;
+    idx_t const round_K = ROUNDS - 1;
+    int cell = stream_id;
+
+    int hub_containing_qp = get_assignment_another_cell(q_xyz, cell, dH, data);
+    idx_t* global_idx_current_cell = sorted_global_idx + cell_psum[cell];
+
+    query_own_cell<ROUNDS>(
+        cell,
+        0,
+        hub_containing_qp,
+        K,
+        arr_idx_arr,
+        arr_x_arr,
+        arr_y_arr,
+        arr_z_arr,
+        q_xyz,
+        data,
+        dH,
+        global_idx_current_cell,
+        dH_psum,
+        best_point_id,
+        best_distance,
+        dD_arr,
+        iD_arr,
+        H,
+        cell_bin_counts[cell],
+        hubs_scanned + global_query_id,
+        pointsScanned + global_query_id
+    );
+
+    for (int i = 0; i < num_cells; i++) {
+        if (i != stream_id) {
+            float kth_distance = __shfl_sync(0xFFFFFFFF, best_distance[round_K], lane_K);
+            if (distance_to_cell_aabb(q_xyz, &cell_mins[i * dim], &cell_maxs[i * dim], dim) > sqrt(kth_distance)) {
+                continue;
+            }
+            hub_containing_qp = get_assignment_another_cell(q_xyz, i, dH, data);
+            global_idx_current_cell = sorted_global_idx + cell_psum[i];
+            query_cell<ROUNDS>(
+                i,
+                0,
+                hub_containing_qp,
+                K,
+                arr_idx_arr,
+                arr_x_arr,
+                arr_y_arr,
+                arr_z_arr,
+                q_xyz,
+                data,
+                dH,
+                global_idx_current_cell,
+                dH_psum,
+                best_point_id,
+                best_distance,
+                dD_arr,
+                iD_arr,
+                H,
+                cell_bin_counts[i],
+                hubs_scanned + global_query_id,
+                pointsScanned + global_query_id
+            );
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < ROUNDS; ++r) {
+        int const global_lane_id = r * warp_size + lane_id;
+        if (global_lane_id < K) {
+            int const neighbour_location = global_query_id * K + global_lane_id;
+            solutions_knn[neighbour_location] = best_point_id[r];
+            solutions_distances[neighbour_location] = best_distance[r];
+        }
+    }
+}
+
 //--------------End of query kernels-------------------------------
 //--------------Construction and Query-----------------------------
+/**
+ * Construction and query. Supports two modes:
+ * - Q array: pass query_points != nullptr (q * 3 floats). Query points need not be in the dataset.
+ * - Q index: pass query_points == nullptr and queries (q indices into data). Omit or pass q==0 to use all n points as queries.
+ */
 template <class R>
-void C_and_Q(std::size_t n, R *data, std::size_t q, idx_t *queries, std::size_t k, unsigned char* __restrict__ frozen, idx_t *results_knn, R *results_distances, std::string& mesh_name)
+void C_and_Q(std::size_t n, R *data, std::size_t q, idx_t *queries, std::size_t k, unsigned char* __restrict__ frozen, idx_t *results_knn, R *results_distances, std::string& mesh_name, R* query_points = nullptr)
 {
 
     int constexpr block_size = 1024;
@@ -1260,17 +1404,105 @@ void C_and_Q(std::size_t n, R *data, std::size_t q, idx_t *queries, std::size_t 
         cudaMemcpy(d_dD_arr, dD_arr, sizeof(float*) * num_streams, cudaMemcpyHostToDevice);
         time_section(section_times, "Pointer Transfer", section_names, start, stop);
         //----------------End of Pointer Transfer-----------------------
-        std::vector<int> hubsScanned(n, 0);
-        std::vector<int> pointsScanned(n, 0);
+
+        const bool use_query_points = (query_points != nullptr && q > 0);
+        std::size_t num_queries = use_query_points ? q : n;
+
+        float* d_query_points = nullptr;
+        int* d_query_cell_psum = nullptr;
+        idx_t* d_query_cell_list = nullptr;
+        int* d_query_cell_counts = nullptr;
+        std::vector<int> h_query_cell_counts;
+        std::vector<int> h_query_cell_psum;
+        std::vector<idx_t> h_query_cell_list;
+
+        if (use_query_points) {
+            float range_x = max_vals[0] - min_vals[0];
+            float range_y = max_vals[1] - min_vals[1];
+            float range_z = max_vals[2] - min_vals[2];
+            if (range_x <= 0.f) range_x = 1e-9f;
+            if (range_y <= 0.f) range_y = 1e-9f;
+            if (range_z <= 0.f) range_z = 1e-9f;
+            h_query_cell_counts.assign(num_cells, 0);
+            for (std::size_t j = 0; j < q; ++j) {
+                float x = query_points[j * 3 + 0];
+                float y = query_points[j * 3 + 1];
+                float z = query_points[j * 3 + 2];
+                int bin_x = (int)(((x - min_vals[0]) / range_x) * p);
+                int bin_y = (int)(((y - min_vals[1]) / range_y) * p);
+                int bin_z = (int)(((z - min_vals[2]) / range_z) * p);
+                bin_x = std::min(std::max(bin_x, 0), p - 1);
+                bin_y = std::min(std::max(bin_y, 0), p - 1);
+                bin_z = std::min(std::max(bin_z, 0), p - 1);
+                int bin_id = bin_x * p * p + bin_y * p + bin_z;
+                h_query_cell_counts[bin_id]++;
+            }
+            h_query_cell_psum.resize(num_cells + 1);
+            h_query_cell_psum[0] = 0;
+            for (int c = 0; c < num_cells; ++c)
+                h_query_cell_psum[c + 1] = h_query_cell_psum[c] + h_query_cell_counts[c];
+            std::vector<int> cell_offset(num_cells, 0);
+            h_query_cell_list.resize(q);
+            for (std::size_t j = 0; j < q; ++j) {
+                float x = query_points[j * 3 + 0];
+                float y = query_points[j * 3 + 1];
+                float z = query_points[j * 3 + 2];
+                float range_x = max_vals[0] - min_vals[0];
+                float range_y = max_vals[1] - min_vals[1];
+                float range_z = max_vals[2] - min_vals[2];
+                if (range_x <= 0.f) range_x = 1e-9f;
+                if (range_y <= 0.f) range_y = 1e-9f;
+                if (range_z <= 0.f) range_z = 1e-9f;
+                int bin_x = (int)(((x - min_vals[0]) / range_x) * p);
+                int bin_y = (int)(((y - min_vals[1]) / range_y) * p);
+                int bin_z = (int)(((z - min_vals[2]) / range_z) * p);
+                bin_x = std::min(std::max(bin_x, 0), p - 1);
+                bin_y = std::min(std::max(bin_y, 0), p - 1);
+                bin_z = std::min(std::max(bin_z, 0), p - 1);
+                int bin_id = bin_x * p * p + bin_y * p + bin_z;
+                int pos = h_query_cell_psum[bin_id] + cell_offset[bin_id]++;
+                h_query_cell_list[pos] = (idx_t)j;
+            }
+            CUDA_CALL(cudaMalloc((void**)&d_query_points, sizeof(R) * q * 3));
+            CUDA_CALL(cudaMemcpy(d_query_points, query_points, sizeof(R) * q * 3, cudaMemcpyHostToDevice));
+            CUDA_CALL(cudaMalloc((void**)&d_query_cell_psum, sizeof(int) * (num_cells + 1)));
+            CUDA_CALL(cudaMemcpy(d_query_cell_psum, h_query_cell_psum.data(), sizeof(int) * (num_cells + 1), cudaMemcpyHostToDevice));
+            CUDA_CALL(cudaMalloc((void**)&d_query_cell_list, sizeof(idx_t) * q));
+            CUDA_CALL(cudaMemcpy(d_query_cell_list, h_query_cell_list.data(), sizeof(idx_t) * q, cudaMemcpyHostToDevice));
+            CUDA_CALL(cudaMalloc((void**)&d_query_cell_counts, sizeof(int) * num_cells));
+            CUDA_CALL(cudaMemcpy(d_query_cell_counts, h_query_cell_counts.data(), sizeof(int) * num_cells, cudaMemcpyHostToDevice));
+        }
+
+        std::vector<int> hubsScanned(num_queries, 0);
+        std::vector<int> pointsScanned(num_queries, 0);
         int * d_hubsScanned, * d_pointsScanned;
-        CUDA_CALL(cudaMalloc((void **) &d_hubsScanned, sizeof(int)* n));
-        CUDA_CALL(cudaMalloc((void **) &d_pointsScanned, sizeof(int)* n));
-        cudaMemset(d_hubsScanned, 0, sizeof(int)* n);
-        cudaMemset(d_pointsScanned, 0, sizeof(int)* n);
+        CUDA_CALL(cudaMalloc((void **) &d_hubsScanned, sizeof(int) * num_queries));
+        CUDA_CALL(cudaMalloc((void **) &d_pointsScanned, sizeof(int) * num_queries));
+        cudaMemset(d_hubsScanned, 0, sizeof(int) * num_queries);
+        cudaMemset(d_pointsScanned, 0, sizeof(int) * num_queries);
 
         time_section(section_times, "Log MemAlloc", section_names, start, stop);
         //--------------Query Launch------------------------------
-        
+
+        if (use_query_points) {
+            std::size_t constexpr queries_per_block = 32 / warp_size;
+            for (int i = 0; i < num_streams; ++i) {
+                int n_stream = h_query_cell_counts[i];
+                if (n_stream == 0) continue;
+                int num_blocks = util::CEIL_DIV(n_stream, (int)queries_per_block);
+                switch (util::CEIL_DIV(k, warp_size)) {
+                    case 1: QueryWithPoints<1><<<num_blocks, dim3{warp_size, (int)queries_per_block, 1}, 0, streams[i]>>>(i, k, d_query_cell_counts, d_bin_counts, d_query_points, d_query_cell_psum, d_query_cell_list, results_distances, results_knn, d_arr_idx_arr, d_sorted_idx, d_arr_x_arr, d_arr_y_arr, d_arr_z_arr, d_data_chunks, d_dH, d_dH_psum, d_cell_psum, d_D_arr, d_iD_arr, d_dD_arr, d_cell_maxs, d_cell_mins, d_hubsScanned, d_pointsScanned, num_cells, frozen); break;
+                    case 2: QueryWithPoints<2><<<num_blocks, dim3{warp_size, (int)queries_per_block, 1}, 0, streams[i]>>>(i, k, d_query_cell_counts, d_bin_counts, d_query_points, d_query_cell_psum, d_query_cell_list, results_distances, results_knn, d_arr_idx_arr, d_sorted_idx, d_arr_x_arr, d_arr_y_arr, d_arr_z_arr, d_data_chunks, d_dH, d_dH_psum, d_cell_psum, d_D_arr, d_iD_arr, d_dD_arr, d_cell_maxs, d_cell_mins, d_hubsScanned, d_pointsScanned, num_cells, frozen); break;
+                    case 3: QueryWithPoints<3><<<num_blocks, dim3{warp_size, (int)queries_per_block, 1}, 0, streams[i]>>>(i, k, d_query_cell_counts, d_bin_counts, d_query_points, d_query_cell_psum, d_query_cell_list, results_distances, results_knn, d_arr_idx_arr, d_sorted_idx, d_arr_x_arr, d_arr_y_arr, d_arr_z_arr, d_data_chunks, d_dH, d_dH_psum, d_cell_psum, d_D_arr, d_iD_arr, d_dD_arr, d_cell_maxs, d_cell_mins, d_hubsScanned, d_pointsScanned, num_cells, frozen); break;
+                    case 4: QueryWithPoints<4><<<num_blocks, dim3{warp_size, (int)queries_per_block, 1}, 0, streams[i]>>>(i, k, d_query_cell_counts, d_bin_counts, d_query_points, d_query_cell_psum, d_query_cell_list, results_distances, results_knn, d_arr_idx_arr, d_sorted_idx, d_arr_x_arr, d_arr_y_arr, d_arr_z_arr, d_data_chunks, d_dH, d_dH_psum, d_cell_psum, d_D_arr, d_iD_arr, d_dD_arr, d_cell_maxs, d_cell_mins, d_hubsScanned, d_pointsScanned, num_cells, frozen); break;
+                    case 5: QueryWithPoints<5><<<num_blocks, dim3{warp_size, (int)queries_per_block, 1}, 0, streams[i]>>>(i, k, d_query_cell_counts, d_bin_counts, d_query_points, d_query_cell_psum, d_query_cell_list, results_distances, results_knn, d_arr_idx_arr, d_sorted_idx, d_arr_x_arr, d_arr_y_arr, d_arr_z_arr, d_data_chunks, d_dH, d_dH_psum, d_cell_psum, d_D_arr, d_iD_arr, d_dD_arr, d_cell_maxs, d_cell_mins, d_hubsScanned, d_pointsScanned, num_cells, frozen); break;
+                    case 6: QueryWithPoints<6><<<num_blocks, dim3{warp_size, (int)queries_per_block, 1}, 0, streams[i]>>>(i, k, d_query_cell_counts, d_bin_counts, d_query_points, d_query_cell_psum, d_query_cell_list, results_distances, results_knn, d_arr_idx_arr, d_sorted_idx, d_arr_x_arr, d_arr_y_arr, d_arr_z_arr, d_data_chunks, d_dH, d_dH_psum, d_cell_psum, d_D_arr, d_iD_arr, d_dD_arr, d_cell_maxs, d_cell_mins, d_hubsScanned, d_pointsScanned, num_cells, frozen); break;
+                    case 7: QueryWithPoints<7><<<num_blocks, dim3{warp_size, (int)queries_per_block, 1}, 0, streams[i]>>>(i, k, d_query_cell_counts, d_bin_counts, d_query_points, d_query_cell_psum, d_query_cell_list, results_distances, results_knn, d_arr_idx_arr, d_sorted_idx, d_arr_x_arr, d_arr_y_arr, d_arr_z_arr, d_data_chunks, d_dH, d_dH_psum, d_cell_psum, d_D_arr, d_iD_arr, d_dD_arr, d_cell_maxs, d_cell_mins, d_hubsScanned, d_pointsScanned, num_cells, frozen); break;
+                    case 8: QueryWithPoints<8><<<num_blocks, dim3{warp_size, (int)queries_per_block, 1}, 0, streams[i]>>>(i, k, d_query_cell_counts, d_bin_counts, d_query_points, d_query_cell_psum, d_query_cell_list, results_distances, results_knn, d_arr_idx_arr, d_sorted_idx, d_arr_x_arr, d_arr_y_arr, d_arr_z_arr, d_data_chunks, d_dH, d_dH_psum, d_cell_psum, d_D_arr, d_iD_arr, d_dD_arr, d_cell_maxs, d_cell_mins, d_hubsScanned, d_pointsScanned, num_cells, frozen); break;
+                    default: assert(false && "Rounds required to fulfill k value will exceed thread register allotment.");
+                }
+            }
+        } else {
         for (int i = 0; i < num_streams; ++i) {
             std::size_t n_stream = h_bin_counts[i];  
             std::size_t constexpr queries_per_block = 32 / warp_size;
@@ -1361,6 +1593,7 @@ void C_and_Q(std::size_t n, R *data, std::size_t q, idx_t *queries, std::size_t 
                 default: assert(false && "Rounds required to fulfill k value will exceed thread register allotment.");
             }
         }
+        }
         time_section(section_times, "Query", section_names, start, stop);
         //-----------------Memory Free------------------------
         for (int i = 0; i < num_streams; ++i) {
@@ -1398,6 +1631,12 @@ void C_and_Q(std::size_t n, R *data, std::size_t q, idx_t *queries, std::size_t 
         cudaFree(d_sorted_idx);
         cudaFree(d_cell_mins);
         cudaFree(d_cell_maxs);
+        if (use_query_points) {
+            cudaFree(d_query_points);
+            cudaFree(d_query_cell_psum);
+            cudaFree(d_query_cell_list);
+            cudaFree(d_query_cell_counts);
+        }
         time_section(section_times, "Pointer free", section_names, start, stop);
         //-----------------End------------------------
         cudaEventDestroy(start);

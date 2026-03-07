@@ -474,12 +474,16 @@ static void append_eval_iters_csv(
     float theta_lt_30_pct, float theta_gt_90_pct,
     float dH,
     float iter_remesh_ms,
-    float total_remesh_ms
+    float total_remesh_ms,
+    int freeze_cell_num,
+    int n_vertices
 ){
     const bool exists = std::filesystem::exists(path);
 
     std::ofstream out(path, std::ios::app);
     if (!out) return;
+
+    float freeze_pct = (n_vertices > 0) ? (100.f * (float)freeze_cell_num / (float)n_vertices) : 0.f;
 
     // Write header once (in canonical order)
     if (!exists) {
@@ -489,7 +493,8 @@ static void append_eval_iters_csv(
           "theta_min,theta_min_avg,"
           "theta_lt_30_pct,theta_gt_90_pct,"
           "dH,"
-          "iter_remesh_ms,total_remesh_ms\n";
+          "iter_remesh_ms,total_remesh_ms,"
+          "freeze_cell_num,n_vertices,freeze_pct\n";
     }
 
     // Write data row in the SAME order
@@ -504,7 +509,10 @@ static void append_eval_iters_csv(
         << theta_gt_90_pct << ","
         << dH << ","
         << iter_remesh_ms << ","
-        << total_remesh_ms
+        << total_remesh_ms << ","
+        << freeze_cell_num << ","
+        << n_vertices << ","
+        << freeze_pct
         << "\n";
 }
 

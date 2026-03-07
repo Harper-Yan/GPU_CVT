@@ -144,11 +144,7 @@ __global__ void project_centroids_to_mesh(const float3* __restrict__ cent3d,
                                          float3* __restrict__ out_Snew){
     int qi = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (qi >= nQ) return;
-    if(frozen[qi]) 
-    {   
-        out_Snew[qi] = Sold[qi];
-        return;
-    }
+
     float3 c = cent3d[qi];
 
     float best = 1e30f;

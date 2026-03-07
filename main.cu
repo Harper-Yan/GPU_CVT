@@ -8,9 +8,146 @@
 #include <fstream>
 #include <iostream>
 #include <cstdlib>
+#include <cmath>
 #include <filesystem>
 #include <cstdio>
 #include <cstring>
+#include <vector>
+#include <algorithm>
+
+// ─── Mode 1: 5-tier (nv only). Same params as mode 2: uniform disp_thr, streak 10+5*tier ─
+namespace tier1 {
+    static const double TIER_THRESHOLDS[4] = {0.15, 0.35, 0.55, 0.80};
+    static const float DISP_THR[5]  = {1e-3f, 1e-3f, 1e-3f, 1e-3f, 1e-3f};
+    static const int   STREAK[5]    = {5, 10, 15, 20, 25};
+
+    static void compute_tier_id_v1(int nV, const std::vector<double>& nv, std::vector<unsigned char>& tier_id) {
+        tier_id.resize((size_t)nV);
+        for (int i = 0; i < nV; ++i) {
+            int t = 0;
+            while (t < 4 && nv[i] >= TIER_THRESHOLDS[t]) t++;
+            tier_id[i] = (unsigned char)t;
+        }
+    }
+}
+
+// ─── Mode 2: 6-tier (testfreeze2.py, sharp split by L) ────────────────────────
+namespace tier2 {
+    static const double TIER_THRESHOLDS[4] = {0.15, 0.35, 0.55, 0.80};
+    static const double L_SHARP_THR = 0.80;
+    static const float DISP_THR[6]  = {1e-3f, 1e-3f, 1e-3f, 1e-3f, 1e-3f, 1e-3f};
+    static const int   STREAK[6]    = {5, 10, 15, 20, 25, 10};  // tier 4 (sharp_B, less L) stricter; tier 5 (sharp_A, more L) looser (streak 10)
+
+    static void normal_variation_score(int nV, int k, const float* hN, const idx_t* hKNN, std::vector<double>& nv_out) {
+        nv_out.resize((size_t)nV);
+        for (int i = 0; i < nV; ++i) {
+            double sum_cos = 0.0;
+            int count = 0;
+            for (int j = 0; j < k; ++j) {
+                int jj = (int)hKNN[(size_t)i * k + j];
+                if (jj < 0 || jj >= nV) continue;
+                double cos_ij = (double)hN[i*3+0] * (double)hN[jj*3+0]
+                              + (double)hN[i*3+1] * (double)hN[jj*3+1]
+                              + (double)hN[i*3+2] * (double)hN[jj*3+2];
+                if (cos_ij > 1.0) cos_ij = 1.0;
+                if (cos_ij < -1.0) cos_ij = -1.0;
+                sum_cos += cos_ij;
+                count++;
+            }
+            nv_out[i] = (count > 0) ? (1.0 - sum_cos / (double)count) : 0.0;
+        }
+    }
+
+    // 3x3 symmetric eigensolver: returns lambda1 >= lambda2 >= lambda3.
+    static void sym3_eigenvalues(const double C[9], double lam[3]) {
+        double v[3] = {1.0, 0.0, 0.0};
+        for (int it = 0; it < 20; ++it) {
+            double w[3];
+            w[0] = C[0]*v[0] + C[1]*v[1] + C[2]*v[2];
+            w[1] = C[3]*v[0] + C[4]*v[1] + C[5]*v[2];
+            w[2] = C[6]*v[0] + C[7]*v[1] + C[8]*v[2];
+            double n = std::sqrt(w[0]*w[0] + w[1]*w[1] + w[2]*w[2]);
+            if (n < 1e-30) break;
+            v[0] = w[0]/n; v[1] = w[1]/n; v[2] = w[2]/n;
+        }
+        lam[0] = v[0]*(C[0]*v[0]+C[1]*v[1]+C[2]*v[2])
+               + v[1]*(C[3]*v[0]+C[4]*v[1]+C[5]*v[2])
+               + v[2]*(C[6]*v[0]+C[7]*v[1]+C[8]*v[2]);
+        double C2[9];
+        for (int i = 0; i < 9; ++i) C2[i] = C[i];
+        C2[0] -= lam[0]*v[0]*v[0]; C2[1] -= lam[0]*v[0]*v[1]; C2[2] -= lam[0]*v[0]*v[2];
+        C2[3] -= lam[0]*v[1]*v[0]; C2[4] -= lam[0]*v[1]*v[1]; C2[5] -= lam[0]*v[1]*v[2];
+        C2[6] -= lam[0]*v[2]*v[0]; C2[7] -= lam[0]*v[2]*v[1]; C2[8] -= lam[0]*v[2]*v[2];
+        double v2[3] = {0.0, 1.0, 0.0};
+        for (int it = 0; it < 20; ++it) {
+            double w[3];
+            w[0] = C2[0]*v2[0] + C2[1]*v2[1] + C2[2]*v2[2];
+            w[1] = C2[3]*v2[0] + C2[4]*v2[1] + C2[5]*v2[2];
+            w[2] = C2[6]*v2[0] + C2[7]*v2[1] + C2[8]*v2[2];
+            double n = std::sqrt(w[0]*w[0] + w[1]*w[1] + w[2]*w[2]);
+            if (n < 1e-30) break;
+            v2[0] = w[0]/n; v2[1] = w[1]/n; v2[2] = w[2]/n;
+        }
+        lam[1] = v2[0]*(C2[0]*v2[0]+C2[1]*v2[1]+C2[2]*v2[2])
+               + v2[1]*(C2[3]*v2[0]+C2[4]*v2[1]+C2[5]*v2[2])
+               + v2[2]*(C2[6]*v2[0]+C2[7]*v2[1]+C2[8]*v2[2]);
+        lam[2] = C[0] + C[4] + C[8] - lam[0] - lam[1];
+    }
+
+    static void normal_covariance_L(int nV, int k, const float* hN, const idx_t* hKNN, std::vector<double>& L_out) {
+        L_out.resize((size_t)nV, 0.0);
+        for (int i = 0; i < nV; ++i) {
+            double mean[3] = {0,0,0};
+            int count = 0;
+            for (int j = 0; j < k; ++j) {
+                int jj = (int)hKNN[(size_t)i * k + j];
+                if (jj < 0 || jj >= nV) continue;
+                mean[0] += (double)hN[jj*3+0];
+                mean[1] += (double)hN[jj*3+1];
+                mean[2] += (double)hN[jj*3+2];
+                count++;
+            }
+            if (count < 2) continue;
+            mean[0] /= count; mean[1] /= count; mean[2] /= count;
+            double C[9] = {0,0,0,0,0,0,0,0,0};
+            for (int j = 0; j < k; ++j) {
+                int jj = (int)hKNN[(size_t)i * k + j];
+                if (jj < 0 || jj >= nV) continue;
+                double n0 = (double)hN[jj*3+0] - mean[0];
+                double n1 = (double)hN[jj*3+1] - mean[1];
+                double n2 = (double)hN[jj*3+2] - mean[2];
+                C[0] += n0*n0; C[1] += n0*n1; C[2] += n0*n2;
+                C[3] += n1*n0; C[4] += n1*n1; C[5] += n1*n2;
+                C[6] += n2*n0; C[7] += n2*n1; C[8] += n2*n2;
+            }
+            double lam[3];
+            sym3_eigenvalues(C, lam);
+            if (lam[0] > lam[1]) std::swap(lam[0], lam[1]);
+            if (lam[1] > lam[2]) std::swap(lam[1], lam[2]);
+            if (lam[0] > lam[1]) std::swap(lam[0], lam[1]);
+            if (lam[2] > 1e-30)
+                L_out[i] = (lam[2] - lam[1]) / lam[2];
+        }
+    }
+
+    static void compute_tier_id_v2(int nV, int k, const float* hN, const idx_t* hKNN,
+                                   std::vector<double>& nv, std::vector<double>& L_site,
+                                   std::vector<unsigned char>& tier_id) {
+        nv.resize((size_t)nV);
+        L_site.resize((size_t)nV, 0.0);
+        tier_id.resize((size_t)nV);
+        normal_variation_score(nV, k, hN, hKNN, nv);
+        normal_covariance_L(nV, k, hN, hKNN, L_site);
+        for (int i = 0; i < nV; ++i) {
+            int t = 0;
+            while (t < 4 && nv[i] >= TIER_THRESHOLDS[t]) t++;
+            if (t == 4) {
+                if (L_site[i] > L_SHARP_THR) t = 5;
+            }
+            tier_id[i] = (unsigned char)t;
+        }
+    }
+}
 
 struct IsUnfrozen {
     __host__ __device__ bool operator()(const unsigned char f) const {
@@ -161,6 +298,19 @@ static void write_frozen_log_txt(const char* path, const unsigned char* frozen, 
     for (int i = 0; i < nV; ++i) out << (int)frozen[(size_t)i] << "\n";
 }
 
+template<int K, typename IndexT>
+__global__ void restore_prev_knn_for_frozen_kernel(
+    const unsigned char* __restrict__ frozen,
+    const IndexT* __restrict__ prev_knn,
+    IndexT* __restrict__ knn,
+    int n
+){
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= n || !frozen[i]) return;
+    for (int a = 0; a < K; ++a)
+        knn[i * K + a] = prev_knn[i * K + a];
+}
+
 static void append_run_csv(
     const std::string& csv_path,
     const std::string& mesh_name,
@@ -204,42 +354,32 @@ int main(int argc, char** argv)
     if (argc >= 3) mode = std::atoi(argv[2]);
 
     // modes:
-    // 0: baseline (gpu_cvt)      - keep existing behavior (dFrozen is computed then cleared each iter)
-    // 1: freezing_cvt            - keep existing behavior (dFrozen accumulates across iters)
-    // 2: secured_ccu             - secured centroids + secured freezing condition
-    const char* mode_name = (mode == 0) ? "baseline"
-                         : (mode == 1) ? "freezing_cvt"
-                         : "secured_ccu";
+    // 0: baseline (gpu_cvt)         - dFrozen computed then cleared each iter
+    // 1: freezing_cvt               - 5-tier freeze (testfreeze.py params)
+    // 2: freezing_cvt_tiered       - 6-tier freeze (testfreeze2.py, sharp split by L)
+    const char* mode_name = (mode == 0) ? "baseline" : (mode == 2 ? "freezing_cvt_tiered" : "freezing_cvt");
     printf("mode %d (%s)\n", mode, mode_name);
-
-    const int freeze_mode = (mode != 0) ? 1 : 0;
 
     // ---------------- Tunable constants ----------------
     constexpr int   THREADS        = 1024;
     constexpr int   MAX_POLY        = 256;
     constexpr int   KPROJ           = 5;
-    constexpr int   TOP_FREEZE_NEIGH = 3;
-    constexpr int   DUMP_STRIDE     = 25;     // dump an .obj every N iters
-    constexpr float GROWTH_EPS      = 5e-4f;  // used by flat/growth heuristics
+    constexpr int   DUMP_STRIDE     = 10;     // dump an .obj and eval row every N iters
     constexpr float DEGENERATE_EPS  = 1e-6f; // degenerate-triangle test epsilon
 
     constexpr int   K_NEIGH         = 32;
     constexpr int   K_SITE          = K_NEIGH + 1;
 
-    int total_iter = 1000;
-    float freeze_disp = 1e-4f;
-    int freeze_monitor_iters = 5;    
+    int total_iter = 100;
+    const float freeze_disp = 5e-5f;
+    int freeze_monitor_iters = 5;
+    const float thresh2 = freeze_disp * freeze_disp;
     // ----------------------------------------------------
-
-    float thresh2 = freeze_disp * freeze_disp;
-    float last_frozenRatio = 0.0f;
-    float frozenRatio_ema = 0.0f;
-    int   flat_counter = 0;
-    int last_freeze_bucket = -1;
 
     int used_iters = 0;
     float final_converge_rate = 0.0f;
     int final_nf = 0;
+    float last_frozenRatio = 0.0f;
 
     std::vector<unsigned char> hFrozenIter;
 
@@ -375,6 +515,37 @@ int main(int argc, char** argv)
     cudaMalloc(&dFreezeStreak, (size_t)nV);
     cudaMemset(dFreezeStreak, 0, (size_t)nV);
 
+    unsigned char* d_tier_id = nullptr;
+    float* d_thresh2_tier = nullptr;
+    int* d_streak_tier = nullptr;
+    if (mode == 1) {
+        cudaMalloc(&d_tier_id, (size_t)nV);
+        cudaMalloc(&d_thresh2_tier, 6 * sizeof(float));
+        cudaMalloc(&d_streak_tier, 6 * sizeof(int));
+        float h_thresh2[6];
+        int h_streak[6];
+        for (int t = 0; t < 5; ++t) {
+            float d = tier1::DISP_THR[t];
+            h_thresh2[t] = d * d;
+            h_streak[t] = tier1::STREAK[t];
+        }
+        h_thresh2[5] = h_thresh2[4];
+        h_streak[5] = h_streak[4];
+        cudaMemcpy(d_thresh2_tier, h_thresh2, 6 * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_streak_tier, h_streak, 6 * sizeof(int), cudaMemcpyHostToDevice);
+    } else if (mode == 2) {
+        cudaMalloc(&d_tier_id, (size_t)nV);
+        cudaMalloc(&d_thresh2_tier, 6 * sizeof(float));
+        cudaMalloc(&d_streak_tier, 6 * sizeof(int));
+        float h_thresh2[6];
+        for (int t = 0; t < 6; ++t) {
+            float d = tier2::DISP_THR[t];
+            h_thresh2[t] = d * d;
+        }
+        cudaMemcpy(d_thresh2_tier, h_thresh2, 6 * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_streak_tier, tier2::STREAK, 6 * sizeof(int), cudaMemcpyHostToDevice);
+    }
+
     std::vector<unsigned char> hFrozen(nV);
     std::vector<int> hActiveIdx(nV);
     int* dActiveIdx = nullptr;
@@ -388,12 +559,6 @@ int main(int argc, char** argv)
         return nA;
     };
 
-
-    // For secured_ccu (mode==2): record whether each cell reached its security radius.
-    // This flag gates freezing: only freeze if (low displacement) && (same neighbor list) && (secureReached).
-    unsigned char* dSecureReached = nullptr;
-    cudaMalloc(&dSecureReached, (size_t)nV);
-    cudaMemset(dSecureReached, 0, (size_t)nV);
 
     int* dFrozenSum = nullptr;
     cudaMalloc(&dFrozenSum, sizeof(int));
@@ -420,12 +585,10 @@ int main(int argc, char** argv)
     dim3 grd((nV + blk.x - 1) / blk.x);
 
     float total_remesh_ms = 0.0f;
-    float first_frozenRatio = -1.0f;
-    bool freeze_disp_doubled = false;
 
-    const char* root_dir = (mode == 0) ? "gpucvt" : (mode == 1) ? "freeze" : "secured_ccu";
-
-    std::string out_dir = std::string(root_dir) + "/" + mesh_name;
+    const char* root_dir = (mode == 0) ? "gpucvt" : (mode == 2 ? "freeze_tiered" : "freeze");
+    const std::string output_base = "experiments/output";
+    std::string out_dir = output_base + "/" + root_dir + "/" + mesh_name;
     std::filesystem::create_directories(out_dir);
 
     std::string eval_csv = out_dir + "/eval_iters.csv";
@@ -434,9 +597,39 @@ int main(int argc, char** argv)
         if (f) {
             fprintf(f,
             "mesh,mode,iter,Qmin,Qavg,theta_min,theta_min_avg,"
-            "theta_lt_30_pct,theta_gt_90_pct,dH,iter_remesh_ms,total_remesh_ms\n");
+            "theta_lt_30_pct,theta_gt_90_pct,dH,iter_remesh_ms,total_remesh_ms,"
+            "freeze_cell_num,n_vertices,freeze_pct\n");
             fclose(f);
         }
+    }
+
+    if (mode == 1) {
+        run_knn_bitonic_hubs(nV, K_SITE, dFrozen, dS, dKNN_sites_raw, dDist_sites_raw);
+        knn_drop_self_kernel<K_SITE, K_NEIGH, idx_t><<<grd, blk>>>(dKNN_sites_raw, dKNN_sites, nV);
+        cudaDeviceSynchronize();
+        std::vector<idx_t> hKNN((size_t)nV * K_NEIGH);
+        std::vector<float> hN((size_t)nV * 3);
+        cudaMemcpy(hKNN.data(), dKNN_sites, (size_t)nV * K_NEIGH * sizeof(idx_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(hN.data(), dN, (size_t)nV * sizeof(float3), cudaMemcpyDeviceToHost);
+        std::vector<double> h_nv;
+        tier2::normal_variation_score(nV, K_NEIGH, hN.data(), hKNN.data(), h_nv);
+        std::vector<unsigned char> h_tier_id;
+        tier1::compute_tier_id_v1(nV, h_nv, h_tier_id);
+        cudaMemcpy(d_tier_id, h_tier_id.data(), (size_t)nV, cudaMemcpyHostToDevice);
+        printf("mode 1: tier assignment done (5-tier, testfreeze.py)\n");
+    } else if (mode == 2) {
+        run_knn_bitonic_hubs(nV, K_SITE, dFrozen, dS, dKNN_sites_raw, dDist_sites_raw);
+        knn_drop_self_kernel<K_SITE, K_NEIGH, idx_t><<<grd, blk>>>(dKNN_sites_raw, dKNN_sites, nV);
+        cudaDeviceSynchronize();
+        std::vector<idx_t> hKNN((size_t)nV * K_NEIGH);
+        std::vector<float> hN((size_t)nV * 3);
+        cudaMemcpy(hKNN.data(), dKNN_sites, (size_t)nV * K_NEIGH * sizeof(idx_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(hN.data(), dN, (size_t)nV * sizeof(float3), cudaMemcpyDeviceToHost);
+        std::vector<double> h_nv, h_L;
+        std::vector<unsigned char> h_tier_id;
+        tier2::compute_tier_id_v2(nV, K_NEIGH, hN.data(), hKNN.data(), h_nv, h_L, h_tier_id);
+        cudaMemcpy(d_tier_id, h_tier_id.data(), (size_t)nV, cudaMemcpyHostToDevice);
+        printf("mode 2: tier assignment done (6-tier, testfreeze2.py sharp split by L)\n");
     }
 
     for (int iter = 0; iter < total_iter; ++iter)
@@ -447,6 +640,8 @@ int main(int argc, char** argv)
         printf("knn_sites_ms %.3f\n", knn_sites_ms);
 
         knn_drop_self_kernel<K_SITE, K_NEIGH, idx_t><<<grd, blk>>>(dKNN_sites_raw, dKNN_sites, nV);
+        if (mode != 0)
+            restore_prev_knn_for_frozen_kernel<K_NEIGH, idx_t><<<grd, blk>>>(dFrozen, dPrevKNN_sites, dKNN_sites, nV);
 
         float knn_site_to_mesh_ms = 0.0f;
         float knn_centroid_to_mesh_ms = 0.0f;
@@ -494,22 +689,7 @@ int main(int argc, char** argv)
         printf("uv_from_mesh_ms %.3f\n", uv_from_mesh_ms);
 
         cudaEventRecord(e0);
-        if (mode == 2) {
-            cudaMemset(dSecureReached, 0, (size_t)nV);
-            // secured_centroids_tangent_voronoi is expected to set dSecureReached[i]=1 once the cell reaches
-            // its security radius criterion.
-            secured_centroids_tangent_voronoi<<<grd, blk>>>(
-                dS, du, dv,
-                dKNN_sites,
-                nV, K_NEIGH,
-                R,
-                dFrozen,
-                dCent,
-                dSecureReached
-            );
-        } else {
-            centroids_tangent_voronoi<<<grd, blk>>>(dS, du, dv, dKNN_sites, nV, K_NEIGH, R, dFrozen, dCent);
-        }
+        centroids_tangent_voronoi<<<grd, blk>>>(dS, du, dv, dKNN_sites, nV, K_NEIGH, R, dFrozen, dCent);
 
         cudaEventRecord(e1);
         cudaEventSynchronize(e1);
@@ -561,50 +741,20 @@ int main(int argc, char** argv)
         cudaMemset(dFreezeCand, 0, (size_t)nV); // pass-1 candidates (this iter only)
 
         cudaEventRecord(e0);
-        if (mode == 2) {
-            // pass-1 (secured): template<int K, typename IndexT>
-            // freeze_test_kernel_secured<K_NEIGH, idx_t><<<grd, blk>>>(
-            //     dS, dSnew,
-            //     dKNN_sites, dPrevKNN_sites,
-            //     dFreezeCand,
-            //     dSecureReached,
-            //     thresh2, nV,
-            //     has_prev_knn,
-            //     dCounts
-            // );
-
-            freeze_test_kernel_secured_streak<K_NEIGH, idx_t><<<grd, blk>>>(
+        if (mode == 1 || mode == 2) {
+            freeze_test_kernel_streak_tiered<K_NEIGH, idx_t><<<grd, blk>>>(
                 dS, dSnew,
                 dKNN_sites, dPrevKNN_sites,
                 dFreezeCand,
                 dFreezeStreak,
-                dSecureReached,
-                thresh2, nV,
+                d_tier_id,
+                d_thresh2_tier,
+                d_streak_tier,
+                nV,
                 has_prev_knn,
-                freeze_monitor_iters,
                 dCounts
             );
-            freeze_apply_cand_kernel<<<grd, blk>>>(dFreezeCand, dFrozen, nV, dCounts);
-            // // pass-2 (secured): template<int K, int TOPN, typename IndexT>
-            // freeze_consensus_pass2_kernel_secured<K_NEIGH, TOP_FREEZE_NEIGH, idx_t><<<grd, blk>>>(
-            //     dKNN_sites,
-            //     dFreezeCand,
-            //     dSecureReached,
-            //     dFrozen,
-            //     nV,
-            //     dCounts
-            // );
         } else {
-            // pass-1 (non-secured): template<int K, typename IndexT>
-            // freeze_test_kernel<K_NEIGH, idx_t><<<grd, blk>>>(
-            //     dS, dSnew,
-            //     dKNN_sites, dPrevKNN_sites,
-            //     dFreezeCand,
-            //     thresh2, nV,
-            //     has_prev_knn,
-            //     dCounts
-            // );
-
             freeze_test_kernel_streak<K_NEIGH, idx_t><<<grd, blk>>>(
                 dS, dSnew,
                 dKNN_sites, dPrevKNN_sites,
@@ -615,16 +765,8 @@ int main(int argc, char** argv)
                 freeze_monitor_iters,
                 dCounts
             );
-            freeze_apply_cand_kernel<<<grd, blk>>>(dFreezeCand, dFrozen, nV, dCounts);
-            // pass-2 (non-secured): template<int K, int TOPN, typename IndexT>
-            // freeze_consensus_pass2_kernel<K_NEIGH, TOP_FREEZE_NEIGH, idx_t><<<grd, blk>>>(
-            //     dKNN_sites,
-            //     dFreezeCand,
-            //     dFrozen,
-            //     nV,
-            //     dCounts
-            // );
         }
+        freeze_apply_cand_kernel<<<grd, blk>>>(dFreezeCand, dFrozen, nV, dCounts);
         cudaEventRecord(e1);
         cudaEventSynchronize(e1);
         float freeze_ms = elapsed_ms(e0, e1);
@@ -642,15 +784,6 @@ int main(int argc, char** argv)
         printf("both %d\n", hCounts[2]);   // pass-1 self-pass
         printf("pass2 %d\n", hCounts[3]);  // newly frozen by consensus
 
-        // ---- A) low-displacement ratio: ONLY for adapting freeze_disp
-        const float lowDispRatio = (float)hCounts[1] / (float)nV;
-
-        // record baseline signal at iter 0 (for the adaptation logic only)
-        if (iter == 0) {
-            first_frozenRatio = lowDispRatio;   // (rename this variable if you want; see note below)
-        }
-
-        // ---- B) frozen ratio from dFrozen: used for all other logic (progress, termination, etc.)
         cudaMemset(dFrozenSum, 0, sizeof(int));
         count_frozen_kernel<<<grd, blk>>>(dFrozen, nV, dFrozenSum);
 
@@ -658,54 +791,7 @@ int main(int argc, char** argv)
         cudaMemcpy(&hFrozenSum, dFrozenSum, sizeof(int), cudaMemcpyDeviceToHost);
 
         const float frozenRatio = (float)hFrozenSum / (float)nV;
-        int freeze_bucket = (int)floorf(frozenRatio * 10.0f);   // 0..10
-
-        if (freeze_bucket > last_freeze_bucket) {
-            // We crossed a new 10% boundary
-            if (last_freeze_bucket >= 0) {   // skip at iter 0 initialization
-                //freeze_disp *= 0.5f;         // tighten by 10%
-                //thresh2 = freeze_disp * freeze_disp;
-                freeze_monitor_iters += 5;
-
-                printf("[freeze_disp] tighten at %.0f%% frozen → freeze_disp = %.6e\n",
-                    freeze_bucket * 10.0f, freeze_disp);
-            }
-
-            last_freeze_bucket = freeze_bucket;
-        }
-
-        // -------------------- Adaptation of freeze_disp --------------------
-        // Only based on lowDispRatio signal (NOT frozenRatio).
-        // Keep your original intent: only decide after first 2 iters.
-        if (iter == 1) {
-            // gate: if iter0 lowDisp was already tiny and iter1 is still tiny => too strict => relax
-            if (first_frozenRatio < GROWTH_EPS && lowDispRatio < GROWTH_EPS) {
-
-                freeze_disp *= 5.0f;
-                thresh2 = freeze_disp * freeze_disp;
-
-                // reset loop + plateau detector
-                flat_counter = 0;
-                first_frozenRatio = -1.0f;
-                iter = -1; // next ++iter becomes 0
-
-                cudaMemset(dFreezeStreak, 0, (size_t)nV);
-
-                {
-                    FILE* f = fopen(eval_csv.c_str(), "w");
-                    if (f) {
-                        fprintf(f,
-                            "mesh,mode,iter,Qmin,Qavg,theta_min,theta_min_avg,"
-                            "theta_lt_30_pct,theta_gt_90_pct,dH,iter_remesh_ms,total_remesh_ms\n");
-                        fclose(f);
-                    }
-                }
-
-                continue;
-            }
-        }
-
-        // -------------------- Everything else uses frozenRatio --------------------
+        last_frozenRatio = frozenRatio;
         printf("total frozen so far %d / %d (%.2f%%)\n",
             hFrozenSum, nV, frozenRatio * 100.0f);
 
@@ -826,16 +912,12 @@ int main(int argc, char** argv)
         if (iter % DUMP_STRIDE == 0) {
 
             char path[512];
-            std::snprintf(path, sizeof(path),
-                        "%s/%s/iter_%03d.obj",
-                        root_dir, mesh_name.c_str(), iter);
+            std::snprintf(path, sizeof(path), "%s/iter_%03d.obj", out_dir.c_str(), iter);
 
             write_obj_cpu(path, hSnew, hFnew);
 
             char fpath[512];
-            std::snprintf(fpath, sizeof(fpath),
-                        "%s/%s/iter_%03d_frozen.txt",
-                        root_dir, mesh_name.c_str(), iter);
+            std::snprintf(fpath, sizeof(fpath), "%s/iter_%03d_frozen.txt", out_dir.c_str(), iter);
 
             if (!hFrozenIter.empty()) {
                 write_frozen_log_txt(fpath, hFrozenIter.data(), nV);
@@ -893,13 +975,15 @@ int main(int argc, char** argv)
                 theta_lt_30_pct, theta_gt_90_pct,
                 dH,
                 iter_remesh_ms,
-                total_remesh_ms
+                total_remesh_ms,
+                hFrozenSum,
+                nV
             );
 
         }
 
         used_iters = iter + 1;
-        final_converge_rate = frozenRatio_ema;
+        final_converge_rate = last_frozenRatio;
         final_nf = (int)hFnew.size();
 
         //if (terminate_now) break;
@@ -908,8 +992,8 @@ int main(int argc, char** argv)
     printf("\nTotal remeshing time (mesh rebuilding excluded): %.3f ms\n", total_remesh_ms);
 
     {
-        const char* mode_str = (mode == 0) ? "gpucvt" : (mode == 1) ? "freeze" : "secured_ccu";
-        append_run_csv("runs.csv", mesh_name, mode_str, nV, final_nf, final_converge_rate, used_iters, total_remesh_ms);
+        const char* mode_str = (mode == 0) ? "gpucvt" : (mode == 2 ? "freeze_tiered" : "freeze");
+        append_run_csv("experiments/runs.csv", mesh_name, mode_str, nV, final_nf, final_converge_rate, used_iters, total_remesh_ms);
     }
 
     cudaEventDestroy(e0);
@@ -917,7 +1001,11 @@ int main(int argc, char** argv)
 
     cudaFree(dCounts);
     cudaFree(dFrozen);
-    cudaFree(dSecureReached);
+    if (d_tier_id) {
+        cudaFree(d_tier_id);
+        cudaFree(d_thresh2_tier);
+        cudaFree(d_streak_tier);
+    }
     cudaFree(dFrozenSum);
     cudaFree(dKnnV);
     cudaFree(d_vf_off);
