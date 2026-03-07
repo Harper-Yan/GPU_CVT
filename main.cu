@@ -404,9 +404,9 @@ int main(int argc, char** argv)
     const std::string vorpalite_path = "/home/hyan/local/geogram/bin/vorpalite";
     const bool use_geogram = true;
 
-    const float freeze_disp = 5e-5f;
     int freeze_monitor_iters = 5;
-    const float thresh2 = freeze_disp * freeze_disp;
+    // freeze_disp = squared displacement threshold, set below from mesh bbox (0.01 * max bbox edge)^2
+    float freeze_disp = 0.0f;
     // ----------------------------------------------------
 
     int used_iters = 0;
@@ -426,6 +426,10 @@ int main(int argc, char** argv)
     printf("V %d\n", nV);
     printf("F %d\n", nF);
     if (nV == 0 || nF == 0) return 1;
+
+    // Same freeze_disp (squared) for all 3 modes: (0.01 * R)^2, R = max bbox edge from load_obj
+    freeze_disp = 0.01f * R * 0.01f * R;
+    printf("freeze_disp %.6g (squared, linear=0.01*R R=%.6g)\n", (double)freeze_disp, (double)R);
 
     // ---- Reference mesh (input) BVH built once ----
     std::vector<BVHNode> refNodes;
@@ -561,13 +565,10 @@ int main(int argc, char** argv)
         cudaMalloc(&d_streak_tier, 6 * sizeof(int));
         float h_thresh2[6];
         int h_streak[6];
-        for (int t = 0; t < 5; ++t) {
-            float d = tier1::DISP_THR[t];
-            h_thresh2[t] = d * d;
-            h_streak[t] = tier1::STREAK[t];
+        for (int t = 0; t < 6; ++t) {
+            h_thresh2[t] = freeze_disp;  // same freeze_disp (squared) for all tiers
+            h_streak[t] = (t < 5) ? tier1::STREAK[t] : tier1::STREAK[4];
         }
-        h_thresh2[5] = h_thresh2[4];
-        h_streak[5] = h_streak[4];
         cudaMemcpy(d_thresh2_tier, h_thresh2, 6 * sizeof(float), cudaMemcpyHostToDevice);
         cudaMemcpy(d_streak_tier, h_streak, 6 * sizeof(int), cudaMemcpyHostToDevice);
     } else if (mode == 2) {
@@ -576,8 +577,7 @@ int main(int argc, char** argv)
         cudaMalloc(&d_streak_tier, 6 * sizeof(int));
         float h_thresh2[6];
         for (int t = 0; t < 6; ++t) {
-            float d = tier2::DISP_THR[t];
-            h_thresh2[t] = d * d;
+            h_thresh2[t] = freeze_disp;  // same freeze_disp (squared) for all tiers
         }
         cudaMemcpy(d_thresh2_tier, h_thresh2, 6 * sizeof(float), cudaMemcpyHostToDevice);
         cudaMemcpy(d_streak_tier, tier2::STREAK, 6 * sizeof(int), cudaMemcpyHostToDevice);
@@ -630,7 +630,9 @@ int main(int argc, char** argv)
             fprintf(f,
             "mesh,mode,iter,Qmin,Qavg,theta_min,theta_min_avg,"
             "theta_lt_30_pct,theta_gt_90_pct,dH,iter_remesh_ms,total_remesh_ms,"
-            "freeze_cell_num,n_vertices,freeze_pct\n");
+            "freeze_cell_num,n_vertices,freeze_pct,"
+            "knn_sites_ms,knn_site_to_mesh_ms,uv_from_mesh_ms,centroids_ms,knn_centroid_to_mesh_ms,project_ms,freeze_ms,"
+            "count_same,count_low_disp,count_both,count_newly_frozen,blocked_by_same,blocked_by_low_disp\n");
             fclose(f);
         }
     }
@@ -788,7 +790,7 @@ int main(int argc, char** argv)
                 dKNN_sites, dPrevKNN_sites,
                 dFreezeCand,
                 dFreezeStreak,
-                thresh2, nV,
+                freeze_disp, nV,
                 has_prev_knn,
                 freeze_monitor_iters,
                 dCounts
@@ -811,6 +813,14 @@ int main(int argc, char** argv)
         printf("low displacement %d\n", hCounts[1]);
         printf("both %d\n", hCounts[2]);   // pass-1 self-pass
         printf("pass2 %d\n", hCounts[3]);  // newly frozen by consensus
+        if (mode != 0) {
+            int blocked_by_same = hCounts[1] - hCounts[2];  // had low disp, failed same-neighbors
+            int blocked_by_low = hCounts[0] - hCounts[2];   // had same neighbors, failed low disp
+            if (blocked_by_same < 0) blocked_by_same = 0;
+            if (blocked_by_low < 0) blocked_by_low = 0;
+            printf("freeze_investigate: blocked_by_same=%d blocked_by_low_disp=%d (larger blocks more)\n",
+                blocked_by_same, blocked_by_low);
+        }
 
         cudaMemset(dFrozenSum, 0, sizeof(int));
         count_frozen_kernel<<<grd, blk>>>(dFrozen, nV, dFrozenSum);
@@ -887,7 +897,8 @@ int main(int argc, char** argv)
         cudaMemcpy(hN, dN, sizeof(float3) * 10, cudaMemcpyDeviceToHost);
 
         float3 mn = make_float3(1e30f,1e30f,1e30f), mx = make_float3(-1e30f,-1e30f,-1e30f);
-        cudaMemcpy(hSnew.data(), dS, (size_t)nV * sizeof(float3), cudaMemcpyDeviceToHost);
+        cudaMemcpy(hSnew.data(), dS,
+         (size_t)nV * sizeof(float3), cudaMemcpyDeviceToHost);
 
         for (int i = 0; i < nV; ++i) {
             const float3 p = hSnew[(size_t)i];
@@ -1038,7 +1049,18 @@ int main(int argc, char** argv)
                 iter_remesh_ms,
                 total_remesh_ms,
                 hFrozenSum,
-                nV
+                nV,
+                knn_sites_ms,
+                knn_site_to_mesh_ms,
+                uv_from_mesh_ms,
+                centroids_ms,
+                knn_centroid_to_mesh_ms,
+                project_ms,
+                freeze_ms,
+                hCounts[0],
+                hCounts[1],
+                hCounts[2],
+                hCounts[3]
             );
 
         }

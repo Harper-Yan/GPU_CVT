@@ -463,6 +463,7 @@ static void eval_quality_angles_cpu(
 
 // ----------------------------
 // CSV append (eval_iters.csv)
+// Step times (exclude vorpalite and evaluation). Freeze counts for low-freeze investigation.
 // ----------------------------
 static void append_eval_iters_csv(
     const std::string& path,
@@ -476,7 +477,20 @@ static void append_eval_iters_csv(
     float iter_remesh_ms,
     float total_remesh_ms,
     int freeze_cell_num,
-    int n_vertices
+    int n_vertices,
+    // Step times (no vorpalite / eval)
+    float knn_sites_ms,
+    float knn_site_to_mesh_ms,
+    float uv_from_mesh_ms,
+    float centroids_ms,
+    float knn_centroid_to_mesh_ms,
+    float project_ms,
+    float freeze_ms,
+    // Freeze-condition counts: which condition blocks freezing most
+    int count_same,
+    int count_low_disp,
+    int count_both,
+    int count_newly_frozen
 ){
     const bool exists = std::filesystem::exists(path);
 
@@ -484,6 +498,10 @@ static void append_eval_iters_csv(
     if (!out) return;
 
     float freeze_pct = (n_vertices > 0) ? (100.f * (float)freeze_cell_num / (float)n_vertices) : 0.f;
+    int blocked_by_same = count_low_disp - count_both;  // had low disp but failed same-neighbors
+    if (blocked_by_same < 0) blocked_by_same = 0;
+    int blocked_by_low_disp = count_same - count_both; // had same neighbors but failed low disp
+    if (blocked_by_low_disp < 0) blocked_by_low_disp = 0;
 
     // Write header once (in canonical order)
     if (!exists) {
@@ -494,7 +512,9 @@ static void append_eval_iters_csv(
           "theta_lt_30_pct,theta_gt_90_pct,"
           "dH,"
           "iter_remesh_ms,total_remesh_ms,"
-          "freeze_cell_num,n_vertices,freeze_pct\n";
+          "freeze_cell_num,n_vertices,freeze_pct,"
+          "knn_sites_ms,knn_site_to_mesh_ms,uv_from_mesh_ms,centroids_ms,knn_centroid_to_mesh_ms,project_ms,freeze_ms,"
+          "count_same,count_low_disp,count_both,count_newly_frozen,blocked_by_same,blocked_by_low_disp\n";
     }
 
     // Write data row in the SAME order
@@ -512,7 +532,20 @@ static void append_eval_iters_csv(
         << total_remesh_ms << ","
         << freeze_cell_num << ","
         << n_vertices << ","
-        << freeze_pct
+        << freeze_pct << ","
+        << knn_sites_ms << ","
+        << knn_site_to_mesh_ms << ","
+        << uv_from_mesh_ms << ","
+        << centroids_ms << ","
+        << knn_centroid_to_mesh_ms << ","
+        << project_ms << ","
+        << freeze_ms << ","
+        << count_same << ","
+        << count_low_disp << ","
+        << count_both << ","
+        << count_newly_frozen << ","
+        << blocked_by_same << ","
+        << blocked_by_low_disp
         << "\n";
 }
 
