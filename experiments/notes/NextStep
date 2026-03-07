@@ -1,0 +1,18 @@
+5. What claims to make
+    - 
+6. What figrues to make
+    - Remeshing quality per number of iteration
+    - Converge rate per iteration
+    - Resulting mesh merging from partial frozen parts
+    - Mesh quality metrics table with baselines
+    - Resulting mesh for across models
+
+7. What baselines to add    
+    Libraries: 
+        - Geogram
+        - CGAL isotropic remeshing (edge split/collapse/flip + smoothing)
+        - RXMesh (GPU triangle mesh processing library)
+        - Point Cloud Library
+    Most recent papers:
+        - Yao et al. 2023 (CAGD) “Accelerating surface remeshing through GPU-based computation of the restricted tangent face”
+        - Parallel computation of 3D clipped Voronoi diagrams (2022)

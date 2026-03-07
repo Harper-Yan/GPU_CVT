@@ -1,0 +1,14 @@
+1. Vertex & F and .obj
+2. Each site norms vector (n * 3). 
+3. Get a tangent plane ( site , norm ,u ,v )
+4. knn among sites (bitonic::hubs)
+5. Clip for Voro cells, for each half space intersect with tangent plane, clip vertexes on 2D
+7. Bary centers bisector
+8. Knn among original mesh vertexes for bisector, library
+9. extract triangles from last knn
+10. project bi to each triangle plane
+11. project bi' to each triangle for bi_repositioned
+12. sort the projectoion distance
+13. move sites
+14. mark a site is done when location and neighbors are stable: how much would be stable?
+14. when all sites are converged, extract mesh
