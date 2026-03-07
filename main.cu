@@ -311,6 +311,34 @@ __global__ void restore_prev_knn_for_frozen_kernel(
         knn[i * K + a] = prev_knn[i * K + a];
 }
 
+// Run Geogram vorpalite to reconstruct mesh from sites (same options as testfreeze/testfreeze2).
+// Returns 0 on success, non-zero on failure.
+static int run_vorpalite(const std::string& vorpalite_exe,
+                         const std::string& sites_xyz,
+                         const std::string& out_obj,
+                         const char* radius = "5%",
+                         int nb_neighbors = 30)
+{
+    std::string cmd;
+    auto quote = [](const std::string& s) {
+        std::string r = "\"";
+        for (char c : s) {
+            if (c == '"' || c == '\\') r += '\\';
+            r += c;
+        }
+        r += '"';
+        return r;
+    };
+    cmd += quote(vorpalite_exe) + " " + quote(sites_xyz) + " " + quote(out_obj);
+    cmd += " co3ne=true pre=false remesh=false post=true";
+    cmd += " co3ne:repair=true";
+    cmd += " co3ne:radius="; cmd += radius;
+    cmd += " co3ne:nb_neighbors="; cmd += std::to_string(nb_neighbors);
+    cmd += " log:quiet=true log:pretty=false";
+    int ret = std::system(cmd.c_str());
+    return ret;
+}
+
 static void append_run_csv(
     const std::string& csv_path,
     const std::string& mesh_name,
@@ -371,6 +399,11 @@ int main(int argc, char** argv)
     constexpr int   K_SITE          = K_NEIGH + 1;
 
     int total_iter = 100;
+    if (argc >= 4) total_iter = std::atoi(argv[3]);
+
+    const std::string vorpalite_path = "/home/hyan/local/geogram/bin/vorpalite";
+    const bool use_geogram = true;
+
     const float freeze_disp = 5e-5f;
     int freeze_monitor_iters = 5;
     const float thresh2 = freeze_disp * freeze_disp;
@@ -487,6 +520,10 @@ int main(int argc, char** argv)
 
     std::vector<Tri> hFnew;
 
+    std::vector<float3> hV_geo;
+    std::vector<int3i> hF_geo;
+    int last_geogram_nf = 0;
+
     float3* dCent = nullptr;
     cudaMalloc(&dCent, (size_t)nV * sizeof(float3));
 
@@ -547,18 +584,13 @@ int main(int argc, char** argv)
     }
 
     std::vector<unsigned char> hFrozen(nV);
-    std::vector<int> hActiveIdx(nV);
-    int* dActiveIdx = nullptr;
-    cudaMalloc(&dActiveIdx, nV*sizeof(int));
 
-    auto build_active_list_cpu = [&]()->int{
-        cudaMemcpy(hFrozen.data(), dFrozen, nV, cudaMemcpyDeviceToHost);
-        int nA = 0;
-        for(int i=0;i<nV;++i) if (!hFrozen[i]) hActiveIdx[nA++] = i;
-        cudaMemcpy(dActiveIdx, hActiveIdx.data(), nA*sizeof(int), cudaMemcpyHostToDevice);
-        return nA;
-    };
-
+    float* dKnnV_dist = nullptr;
+    int* dPrevKnnV = nullptr;
+    if (mode != 0) {
+        cudaMalloc(&dKnnV_dist, (size_t)nV * KPROJ * sizeof(float));
+        cudaMalloc(&dPrevKnnV, (size_t)nV * KPROJ * sizeof(int));
+    }
 
     int* dFrozenSum = nullptr;
     cudaMalloc(&dFrozenSum, sizeof(int));
@@ -646,38 +678,23 @@ int main(int argc, char** argv)
         float knn_site_to_mesh_ms = 0.0f;
         float knn_centroid_to_mesh_ms = 0.0f;
 
-        int nActive = build_active_list_cpu();
-
-        dim3 blkA(256);
-        dim3 grdA((nActive + blkA.x - 1) / blkA.x);
         if (mode != 0) {
-
+            cudaMemcpy(dPrevKnnV, dKnnV, (size_t)nV * KPROJ * sizeof(int), cudaMemcpyDeviceToDevice);
+            knn_site_to_mesh_ms = run_knn_bitonic_query_to_mesh(nV, dV, dS, nV, KPROJ, dFrozen,
+                (idx_t*)dKnnV, dKnnV_dist, "site_to_mesh");
+            restore_prev_knn_vertices_kernel<KPROJ><<<grd, blk>>>(dFrozen, dPrevKnnV, dKnnV, nV);
+            cudaDeviceSynchronize();
+            printf("knn_site_to_mesh_ms %.3f\n", knn_site_to_mesh_ms);
+        } else {
+            dim3 grdK((nV + blk.x - 1) / blk.x);
             cudaEventRecord(e0);
-            knn_vertices_bruteforce_k_active<KPROJ, false><<<grdA, blkA>>>(
-                dV, nV,
-                dS, nV,
-                dActiveIdx, nActive,   // <-- raw device pointer
-                dKnnV
+            knn_vertices_bruteforce_k<KPROJ, false><<<grdK, blk>>>(
+                dV, nV, dS, nV, dFrozen, dKnnV
             );
             cudaEventRecord(e1);
             cudaEventSynchronize(e1);
             knn_site_to_mesh_ms = elapsed_ms(e0, e1);
             printf("knn_site_to_mesh_ms %.3f\n", knn_site_to_mesh_ms);
-        }
-        else{
-                dim3 grd((nV + blk.x - 1) / blk.x);
-
-                cudaEventRecord(e0);
-                knn_vertices_bruteforce_k<KPROJ, false><<<grd, blk>>>(
-                    dV, nV,
-                    dS, nV,
-                    dFrozen,
-                    dKnnV
-                );
-                cudaEventRecord(e1);
-                cudaEventSynchronize(e1);
-                knn_site_to_mesh_ms = elapsed_ms(e0, e1);
-                printf("knn_site_to_mesh_ms %.3f\n", knn_site_to_mesh_ms);
         }
 
         
@@ -697,24 +714,17 @@ int main(int argc, char** argv)
         printf("centroids_ms %.3f\n", centroids_ms);
 
         if (mode != 0) {
-            cudaEventRecord(e0);
-            knn_vertices_bruteforce_k_active<KPROJ, true><<<grdA, blkA>>>(
-                dV, nV,
-                dCent, nV,
-                dActiveIdx, nActive,   
-                dKnnV
-            );
-            cudaEventRecord(e1);
-            cudaEventSynchronize(e1);
-            knn_centroid_to_mesh_ms = elapsed_ms(e0, e1);
+            cudaMemcpy(dPrevKnnV, dKnnV, (size_t)nV * KPROJ * sizeof(int), cudaMemcpyDeviceToDevice);
+            knn_centroid_to_mesh_ms = run_knn_bitonic_query_to_mesh(nV, dV, dCent, nV, KPROJ, dFrozen,
+                (idx_t*)dKnnV, dKnnV_dist, "centroid_to_mesh");
+            restore_prev_knn_vertices_kernel<KPROJ><<<grd, blk>>>(dFrozen, dPrevKnnV, dKnnV, nV);
+            cudaDeviceSynchronize();
             printf("knn_centroid_to_mesh_ms %.3f\n", knn_centroid_to_mesh_ms);
-        }else{
+        } else {
+            dim3 grdK((nV + blk.x - 1) / blk.x);
             cudaEventRecord(e0);
-            knn_vertices_bruteforce_k<KPROJ, true><<<grd, blk>>>(
-                dV, nV,
-                dCent, nV,
-                dFrozen,
-                dKnnV
+            knn_vertices_bruteforce_k<KPROJ, true><<<grdK, blk>>>(
+                dV, nV, dCent, nV, dFrozen, dKnnV
             );
             cudaEventRecord(e1);
             cudaEventSynchronize(e1);
@@ -735,6 +745,24 @@ int main(int argc, char** argv)
         cudaEventSynchronize(e1);
         float project_ms = elapsed_ms(e0, e1);
         printf("project_ms %.3f\n", project_ms);
+
+        {
+            cudaMemcpy(hSnew.data(), dSnew, (size_t)nV * sizeof(float3), cudaMemcpyDeviceToHost);
+            const float eps = 1e-9f;
+            std::vector<float3> tmp(hSnew);
+            std::sort(tmp.begin(), tmp.end(), [](const float3& a, const float3& b) {
+                if (a.x != b.x) return a.x < b.x;
+                if (a.y != b.y) return a.y < b.y;
+                return a.z < b.z;
+            });
+            int unique_pos = 1;
+            for (int i = 1; i < nV; ++i) {
+                float dx = tmp[i].x - tmp[i-1].x, dy = tmp[i].y - tmp[i-1].y, dz = tmp[i].z - tmp[i-1].z;
+                if (dx*dx + dy*dy + dz*dz > eps*eps) unique_pos++;
+            }
+            int duplicate_sites = nV - unique_pos;
+            printf("after projection: unique_pos %d  duplicate_sites %d (of %d)\n", unique_pos, duplicate_sites, nV);
+        }
 
         int has_prev_knn = (iter > 0) ? 1 : 0;
         cudaMemset(dCounts, 0, 4 * sizeof(int));
@@ -844,7 +872,13 @@ int main(int argc, char** argv)
 
         run_knn_bitonic_hubs(nV, K_SITE, dFrozen, dS, dKNN_sites_raw, dDist_sites_raw);
 
-        knn_vertices_bruteforce_k<KPROJ, false><<<grd, blk>>>(dV, nV, dS, nV, dFrozen, dKnnV);
+        if (mode != 0) {
+            cudaMemcpy(dPrevKnnV, dKnnV, (size_t)nV * KPROJ * sizeof(int), cudaMemcpyDeviceToDevice);
+            run_knn_bitonic_query_to_mesh(nV, dV, dS, nV, KPROJ, dFrozen, (idx_t*)dKnnV, dKnnV_dist, "site_to_mesh");
+            restore_prev_knn_vertices_kernel<KPROJ><<<grd, blk>>>(dFrozen, dPrevKnnV, dKnnV, nV);
+        } else {
+            knn_vertices_bruteforce_k<KPROJ, false><<<grd, blk>>>(dV, nV, dS, nV, dFrozen, dKnnV);
+        }
 
         cudaEventRecord(e0);
         uv_from_nearest_vertex_normal<KPROJ><<<grd, blk>>>(dN, dKnnV, du, dv, nV);
@@ -863,58 +897,80 @@ int main(int argc, char** argv)
         float3 bb = make_float3(mx.x-mn.x, mx.y-mn.y, mx.z-mn.z);
         float R2 = 2.0f * 0.5f * std::max(bb.x, std::max(bb.y, bb.z));
 
-        cudaMemset(dPolyN, 0, (size_t)nV * sizeof(int));
-
-        cell_poly2d_kernel<K_NEIGH, MAX_POLY, idx_t><<<grd, blk>>>(
-            dS, du, dv, dKNN_sites, nV,
-            R2,
-            1e-8f,
-            1e-7f,
-            dPoly2d, dPolyN, dPolyLab2
-        );
-
-        cudaMemset(dKeyCount, 0, sizeof(int));
-        emit_faces_from_labels_kernel<MAX_POLY><<<grd, blk>>>(
-            dPolyN, dPolyLab2, nV, dKeys, dKeyCount, (int)maxCand
-        );
-
-        int hCount = 0;
-        cudaMemcpy(&hCount, dKeyCount, sizeof(int), cudaMemcpyDeviceToHost);
-        if (hCount < 0) hCount = 0;
-        if ((size_t)hCount > maxCand) hCount = (int)maxCand;
-
-        hKeys.resize((size_t)hCount);
-        cudaMemcpy(hKeys.data(), dKeys, (size_t)hCount * sizeof(uint64_t), cudaMemcpyDeviceToHost);
-
-        std::sort(hKeys.begin(), hKeys.end());
-        auto it = std::unique(hKeys.begin(), hKeys.end());
-        hKeys.erase(it, hKeys.end());
-
-        decode_keys_to_faces(hKeys, hFnew);
-
-        size_t before = hFnew.size();
-        std::vector<Tri> hFfilt;
-        hFfilt.reserve(before);
-
-        for (const Tri& t : hFnew) {
-            int a = t.a, b = t.b, c = t.c;
-            if (!is_degenerate_tri(hSnew, a, b, c, DEGENERATE_EPS)) {
-                hFfilt.push_back(t);
+        if (use_geogram && (iter % DUMP_STRIDE == 0 || iter == total_iter - 1)) {
+            char sites_xyz_path[512];
+            std::snprintf(sites_xyz_path, sizeof(sites_xyz_path), "%s/iter_%03d_sites.xyz", out_dir.c_str(), iter);
+            write_pts_cpu(sites_xyz_path, hSnew);
+            char obj_path[512];
+            std::snprintf(obj_path, sizeof(obj_path), "%s/iter_%03d.obj", out_dir.c_str(), iter);
+            int vret = run_vorpalite(vorpalite_path, sites_xyz_path, obj_path);
+            if (vret != 0) {
+                fprintf(stderr, "vorpalite failed (exit %d)\n", vret);
+                return 1;
             }
+            hV_geo.clear();
+            hF_geo.clear();
+            load_obj_triangles(obj_path, hV_geo, hF_geo);
+            last_geogram_nf = (int)hF_geo.size();
         }
 
-        size_t after = hFfilt.size();
-        printf("degenerate filtered: %zu removed, %zu kept (from %zu)\n",
-            before - after, after, before);
+        if (!use_geogram) {
+            cudaMemset(dPolyN, 0, (size_t)nV * sizeof(int));
 
-        hFnew.swap(hFfilt);
+            cell_poly2d_kernel<K_NEIGH, MAX_POLY, idx_t><<<grd, blk>>>(
+                dS, du, dv, dKNN_sites, nV,
+                R2,
+                1e-8f,
+                1e-7f,
+                dPoly2d, dPolyN, dPolyLab2
+            );
+
+            cudaMemset(dKeyCount, 0, sizeof(int));
+            emit_faces_from_labels_kernel<MAX_POLY><<<grd, blk>>>(
+                dPolyN, dPolyLab2, nV, dKeys, dKeyCount, (int)maxCand
+            );
+
+            int hCount = 0;
+            cudaMemcpy(&hCount, dKeyCount, sizeof(int), cudaMemcpyDeviceToHost);
+            if (hCount < 0) hCount = 0;
+            if ((size_t)hCount > maxCand) hCount = (int)maxCand;
+
+            hKeys.resize((size_t)hCount);
+            cudaMemcpy(hKeys.data(), dKeys, (size_t)hCount * sizeof(uint64_t), cudaMemcpyDeviceToHost);
+
+            std::sort(hKeys.begin(), hKeys.end());
+            auto it = std::unique(hKeys.begin(), hKeys.end());
+            hKeys.erase(it, hKeys.end());
+
+            decode_keys_to_faces(hKeys, hFnew);
+
+            size_t before = hFnew.size();
+            std::vector<Tri> hFfilt;
+            hFfilt.reserve(before);
+
+            for (const Tri& t : hFnew) {
+                int a = t.a, b = t.b, c = t.c;
+                if (!is_degenerate_tri(hSnew, a, b, c, DEGENERATE_EPS)) {
+                    hFfilt.push_back(t);
+                }
+            }
+
+            size_t after = hFfilt.size();
+            printf("degenerate filtered: %zu removed, %zu kept (from %zu)\n",
+                before - after, after, before);
+
+            hFnew.swap(hFfilt);
+        }
 
         if (iter % DUMP_STRIDE == 0) {
 
             char path[512];
             std::snprintf(path, sizeof(path), "%s/iter_%03d.obj", out_dir.c_str(), iter);
 
-            write_obj_cpu(path, hSnew, hFnew);
+            if (!use_geogram) {
+                write_obj_cpu(path, hSnew, hFnew);
+            }
+            // when use_geogram, vorpalite already wrote path
 
             char fpath[512];
             std::snprintf(fpath, sizeof(fpath), "%s/iter_%03d_frozen.txt", out_dir.c_str(), iter);
@@ -923,20 +979,25 @@ int main(int argc, char** argv)
                 write_frozen_log_txt(fpath, hFrozenIter.data(), nV);
             }
 
-            printf("iter %d V %d cand %d faces %d wrote %s\n",
-                iter, nV, hCount, (int)hFnew.size(), path);
+            const size_t nV_dump = use_geogram ? hV_geo.size() : hSnew.size();
+            const size_t nF_dump = use_geogram ? (size_t)last_geogram_nf : hFnew.size();
+            printf("iter %d V %zu faces %zu wrote %s\n",
+                iter, nV_dump, nF_dump, path);
 
             // ---- Build candidate mesh arrays for evaluation ----
             std::vector<int3i> hFcand;
-            hFcand.reserve(hFnew.size());
-            for (const Tri& t : hFnew) {
-                hFcand.push_back({t.a, t.b, t.c});
+            if (use_geogram) {
+                hFcand.assign(hF_geo.begin(), hF_geo.end());
+            } else {
+                hFcand.reserve(hFnew.size());
+                for (const Tri& t : hFnew) hFcand.push_back({t.a, t.b, t.c});
             }
+            std::vector<float3>& hV_dump = use_geogram ? hV_geo : hSnew;
 
             float Qmin, Qavg, theta_min, theta_min_avg, theta_lt_30_pct, theta_gt_90_pct;
-            eval_quality_angles_cpu(hSnew, hFcand, Qmin, Qavg, theta_min, theta_min_avg, theta_lt_30_pct, theta_gt_90_pct);
+            eval_quality_angles_cpu(hV_dump, hFcand, Qmin, Qavg, theta_min, theta_min_avg, theta_lt_30_pct, theta_gt_90_pct);
 
-            size_t nVc = hSnew.size();
+            size_t nVc = hV_dump.size();
             size_t nFc = hFcand.size();
 
             if (nVc > dVcand_cap) {
@@ -950,7 +1011,7 @@ int main(int argc, char** argv)
                 dFcand_cap = nFc;
             }
 
-            cudaMemcpy(dVcand, hSnew.data(), nVc * sizeof(float3), cudaMemcpyHostToDevice);
+            cudaMemcpy(dVcand, hV_dump.data(), nVc * sizeof(float3), cudaMemcpyHostToDevice);
             cudaMemcpy(dFcand, hFcand.data(), nFc * sizeof(int3i), cudaMemcpyHostToDevice);
 
             float dH = hausdorff_cand_to_ref_gpu(
@@ -984,7 +1045,7 @@ int main(int argc, char** argv)
 
         used_iters = iter + 1;
         final_converge_rate = last_frozenRatio;
-        final_nf = (int)hFnew.size();
+        final_nf = use_geogram ? last_geogram_nf : (int)hFnew.size();
 
         //if (terminate_now) break;
     }
@@ -1007,6 +1068,8 @@ int main(int argc, char** argv)
         cudaFree(d_streak_tier);
     }
     cudaFree(dFrozenSum);
+    if (dKnnV_dist) cudaFree(dKnnV_dist);
+    if (dPrevKnnV) cudaFree(dPrevKnnV);
     cudaFree(dKnnV);
     cudaFree(d_vf_off);
     cudaFree(d_vf_faces);

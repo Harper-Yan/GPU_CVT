@@ -90,6 +90,19 @@ __global__ void knn_vertices_bruteforce_k(const float3* __restrict__ Vpos, int n
     #pragma unroll
     for(int t=0;t<KPROJ;++t) out_idx[base + t] = best_i[t];
 }
+
+/** Restore vertex KNN for frozen sites from previous iteration (bitonic path skips frozen). */
+template<int KPROJ>
+__global__ void restore_prev_knn_vertices_kernel(const unsigned char* __restrict__ frozen,
+    const int* __restrict__ prev_knn, int* __restrict__ out_knn, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n || !frozen[i]) return;
+    int base = i * KPROJ;
+    for (int t = 0; t < KPROJ; ++t)
+        out_knn[base + t] = prev_knn[base + t];
+}
+
 template<int KPROJ, bool EXCLUDE_SELF>
 __global__ void knn_vertices_bruteforce_k_active(
     const float3* __restrict__ Vpos, int nV,
@@ -145,6 +158,7 @@ __global__ void project_centroids_to_mesh(const float3* __restrict__ cent3d,
     int qi = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (qi >= nQ) return;
 
+    // testfreeze2 (lloyd_iter_sites_only): project all sites (no Snew[frozen]=S[frozen])
     float3 c = cent3d[qi];
 
     float best = 1e30f;

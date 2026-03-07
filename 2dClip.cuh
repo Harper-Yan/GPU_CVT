@@ -90,11 +90,8 @@ __global__ void centroids_tangent_voronoi(const float3* __restrict__ S,
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= nV) return;
-    
-    // if (dFrozen[i]) {
-    //     return;
-    // }
 
+    // testfreeze2 (lloyd_iter_sites_only): centroid for ALL sites including frozen
     float3 si = S[i];
     float3 ui = U[i];
     float3 vi = V[i];

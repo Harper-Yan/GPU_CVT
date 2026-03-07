@@ -51,6 +51,31 @@ static inline float run_knn_bitonic_hubs(int N, int K, unsigned char* __restrict
     return ms;
 }
 
+/** KNN from query points (device) to candidate points (device) using bitonic grid.
+ *  Candidates = mesh vertices (dV), queries = sites or centroids (d_query).
+ *  Builds grid from d_candidates; query_points are copied to host for C_and_Q. */
+static inline float run_knn_bitonic_query_to_mesh(int nCand, const float3* d_candidates,
+    const float3* d_query, int nQ, int K, unsigned char* frozen,
+    idx_t* d_knn, float* d_dist, const char* name_for_timing)
+{
+    std::vector<float> h_query((size_t)nQ * 3);
+    cudaMemcpy(h_query.data(), d_query, sizeof(float) * (size_t)nQ * 3, cudaMemcpyDeviceToHost);
+    std::string s(name_for_timing);
+    cudaEvent_t t0, t1;
+    cudaEventCreate(&t0);
+    cudaEventCreate(&t1);
+    cudaEventRecord(t0);
+    bitonic_hubs_grid::C_and_Q<float>(nCand, (float*)d_candidates, (std::size_t)nQ, nullptr,
+        (std::size_t)K, frozen, d_knn, d_dist, s, h_query.data());
+    cudaDeviceSynchronize();
+    cudaEventRecord(t1);
+    cudaEventSynchronize(t1);
+    float ms = elapsed_ms(t0, t1);
+    cudaEventDestroy(t0);
+    cudaEventDestroy(t1);
+    return ms;
+}
+
 template<int KIN, int KOUT, typename IndexT>
 __global__ void knn_drop_self_kernel(const IndexT* __restrict__ in_knn,
                                     IndexT* __restrict__ out_knn,
