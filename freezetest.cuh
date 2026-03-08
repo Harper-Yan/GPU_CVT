@@ -326,6 +326,128 @@ __global__ void freeze_test_kernel_streak_tiered(
     freezeCand[i] = (s >= need) ? 1 : 0;
 }
 
+// ─── Same as above but only first n_neighbors_stable neighbors count for "same" (K_stable <= K) ───
+template<int K, typename IndexT>
+__global__ void freeze_test_kernel_streak_Kstable(
+    const float3* __restrict__ S,
+    const float3* __restrict__ Snew,
+    const IndexT* __restrict__ knn,
+    const IndexT* __restrict__ prev_knn,
+    unsigned char* __restrict__ freezeCand,
+    unsigned char* __restrict__ streak,
+    float thresh2,
+    int nV,
+    int has_prev_knn,
+    int freeze_monitor_iters,
+    int n_neighbors_stable,   // only first this many neighbors for "same" (must be 1..K)
+    int* __restrict__ counts
+){
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= nV) return;
+
+    if (!has_prev_knn) {
+        streak[i] = 0;
+        freezeCand[i] = 0;
+        return;
+    }
+
+    int k_check = n_neighbors_stable;
+    if (k_check > K) k_check = K;
+    if (k_check < 1) k_check = 1;
+
+    bool same = true;
+    for (int j = 0; j < k_check; ++j) {
+        if (knn[i*K + j] != prev_knn[i*K + j]) { same = false; break; }
+    }
+
+    float3 a = S[i];
+    float3 b = Snew[i];
+    float dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+    bool low = (dx*dx + dy*dy + dz*dz) <= thresh2;
+
+    bool both = same && low;
+
+    if (same) atomicAdd(&counts[0], 1);
+    if (low)  atomicAdd(&counts[1], 1);
+    if (both) atomicAdd(&counts[2], 1);
+
+    unsigned char s = streak[i];
+    if (both) {
+        if (s < 255) s++;
+    } else {
+        s = 0;
+    }
+    streak[i] = s;
+
+    int need = freeze_monitor_iters - 1;
+    if (need < 1) need = 1;
+
+    freezeCand[i] = (s >= need) ? 1 : 0;
+}
+
+template<int K, typename IndexT>
+__global__ void freeze_test_kernel_streak_tiered_Kstable(
+    const float3* __restrict__ S,
+    const float3* __restrict__ Snew,
+    const IndexT* __restrict__ knn,
+    const IndexT* __restrict__ prev_knn,
+    unsigned char* __restrict__ freezeCand,
+    unsigned char* __restrict__ streak,
+    const unsigned char* __restrict__ tier_id,
+    const float* __restrict__ thresh2_per_tier,
+    const int* __restrict__ streak_per_tier,
+    int nV,
+    int has_prev_knn,
+    int n_neighbors_stable,   // only first this many neighbors for "same" (1..K)
+    int* __restrict__ counts
+){
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= nV) return;
+
+    if (!has_prev_knn) {
+        streak[i] = 0;
+        freezeCand[i] = 0;
+        return;
+    }
+
+    int k_check = n_neighbors_stable;
+    if (k_check > K) k_check = K;
+    if (k_check < 1) k_check = 1;
+
+    int t = (int)tier_id[i];
+    if (t < 0) t = 0;
+    if (t > 5) t = 5;
+    float thresh2 = thresh2_per_tier[t];
+    int need = streak_per_tier[t] - 1;
+    if (need < 1) need = 1;
+
+    bool same = true;
+    for (int j = 0; j < k_check; ++j) {
+        if (knn[i*K + j] != prev_knn[i*K + j]) { same = false; break; }
+    }
+
+    float3 a = S[i];
+    float3 b = Snew[i];
+    float dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+    bool low = (dx*dx + dy*dy + dz*dz) <= thresh2;
+
+    bool both = same && low;
+
+    if (same) atomicAdd(&counts[0], 1);
+    if (low)  atomicAdd(&counts[1], 1);
+    if (both) atomicAdd(&counts[2], 1);
+
+    unsigned char s = streak[i];
+    if (both) {
+        if (s < 255) s++;
+    } else {
+        s = 0;
+    }
+    streak[i] = s;
+
+    freezeCand[i] = (s >= need) ? 1 : 0;
+}
+
 __global__ void freeze_apply_cand_kernel(
     const unsigned char* __restrict__ freezeCand,
     unsigned char* __restrict__ frozen,
