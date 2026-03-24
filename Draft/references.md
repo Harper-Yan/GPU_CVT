@@ -75,3 +75,13 @@
 [Yan et al. 2009] Dong-Ming Yan, Bruno Levy, Yang Liu, Feng Sun, and Wenping Wang. "Isotropic Remeshing with Fast and Exact Computation of Restricted Voronoi Diagram." *Computer Graphics Forum (SGP)* 28(5), 2009.
 
 [Yan et al. 2014] Dong-Ming Yan, Guanbo Bao, Xiaopeng Zhang, and Peter Wonka. "Low-Resolution Remeshing Using the Localized Restricted Voronoi Diagram." *IEEE Transactions on Visualization and Computer Graphics* 20(10), 2014.
+
+[Fuhrmann et al. 2010] Simon Fuhrmann, Jens Ackermann, Thomas Kalbe, and Michael Goesele. "Direct Resampling for Isotropic Surface Remeshing." In *Vision, Modeling, and Visualization (VMV)*, pages 9–16, 2010.
+
+[Yan and Wonka 2016] Dong-Ming Yan and Peter Wonka. "Non-Obtuse Remeshing with Centroidal Voronoi Tessellation." *IEEE Transactions on Visualization and Computer Graphics* 22(9):2136–2144, 2016.
+
+[Yao et al. 2023] Yuyou Yao, Jingjing Liu, Wenming Wu, Gaofeng Zhang, Benzhu Xu, and Liping Zheng. "Accelerating surface remeshing through GPU-based computation of the restricted tangent face." *Computer Aided Geometric Design* 104:102216, 2023.
+
+[Yao et al. 2023b] Yuyou Yao, Jingjing Liu, Yue Fei, Wenming Wu, Gaofeng Zhang, Dong-Ming Yan, et al. "PowerRTF: Power Diagram based Restricted Tangent Face for Surface Remeshing." *Computer Graphics Forum* 42(5), 2023.
+
+[Fei et al. 2025] Yue Fei, Jingjing Liu, Yuyou Yao, Yusheng Peng, and Liping Zheng. "A Remeshing Method via Adaptive Multiple Original-Facet-Clipping and Centroidal Voronoi Tessellation." arXiv:2505.14306 [cs.GR], 2025.
