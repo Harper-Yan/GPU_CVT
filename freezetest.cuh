@@ -278,6 +278,7 @@ __global__ void freeze_test_kernel_streak_tiered(
     const unsigned char* __restrict__ tier_id,   // 0-5 per site
     const float* __restrict__ thresh2_per_tier,  // 6 tiers
     const int* __restrict__ streak_per_tier,     // 6 tiers
+    const float* __restrict__ jaccard_per_tier,  // 6 floats: curvature-scaled Jaccard threshold
     int nV,
     int has_prev_knn,
     int* __restrict__ counts
@@ -297,10 +298,17 @@ __global__ void freeze_test_kernel_streak_tiered(
     float thresh2 = thresh2_per_tier[t];
     int need = streak_per_tier[t] - 1;
     if (need < 1) need = 1;
+    float jacc_thr = jaccard_per_tier[t];
 
+    // Gate 2: positional match of the first K_check neighbors (curvature-scaled)
+    // jacc_thr encodes the fraction of K that must match positionally:
+    //   flat: 0.5 -> check first K/2 neighbors
+    //   sharp: 1.0 -> check all K neighbors
+    int K_check = (int)(jacc_thr * K + 0.5f);
+    if (K_check < 1) K_check = 1;
+    if (K_check > K) K_check = K;
     bool same = true;
-    #pragma unroll
-    for (int j = 0; j < K; ++j) {
+    for (int j = 0; j < K_check; ++j) {
         if (knn[i*K + j] != prev_knn[i*K + j]) { same = false; break; }
     }
 
@@ -324,6 +332,65 @@ __global__ void freeze_test_kernel_streak_tiered(
     streak[i] = s;
 
     freezeCand[i] = (s >= need) ? 1 : 0;
+}
+
+// ─── Peak-displacement freeze: replaces dual-gate with sliding-window max displacement ───
+template<int K, typename IndexT>
+__global__ void freeze_test_peak_disp(
+    const float3* __restrict__ S,
+    const float3* __restrict__ Snew,
+    const IndexT* __restrict__ knn,
+    const IndexT* __restrict__ prev_knn,
+    unsigned char* __restrict__ freezeCand,
+    float* __restrict__ peak_disp,             // per-site peak displacement (decayed)
+    const unsigned char* __restrict__ tier_id,
+    const float* __restrict__ thresh2_per_tier,
+    const float* __restrict__ decay_per_tier,  // 6 floats: tier-dependent decay
+    int nV,
+    int has_prev_knn,
+    int* __restrict__ counts
+){
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= nV) return;
+
+    // Compute current squared displacement
+    float3 a = S[i];
+    float3 b = Snew[i];
+    float dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+    float disp2 = dx*dx + dy*dy + dz*dz;
+
+    if (!has_prev_knn) {
+        peak_disp[i] = disp2;  // initialize with first displacement
+        freezeCand[i] = 0;
+        return;
+    }
+
+    int t = (int)tier_id[i];
+    if (t < 0) t = 0;
+    if (t > 5) t = 5;
+    float thresh2 = thresh2_per_tier[t];
+    float decay = decay_per_tier[t];
+
+    // Update peak: take max of current disp and decayed old peak
+    float old_peak = peak_disp[i];
+    float new_peak = fmaxf(disp2, old_peak * decay);
+    peak_disp[i] = new_peak;
+
+    bool low = (disp2 <= thresh2);
+    bool peak_low = (new_peak <= thresh2);
+
+    // Also compute KNN stability for reporting (counts[0]) but don't use it for freezing
+    bool same = true;
+    #pragma unroll
+    for (int j = 0; j < K; ++j) {
+        if (knn[i*K + j] != prev_knn[i*K + j]) { same = false; break; }
+    }
+
+    if (same) atomicAdd(&counts[0], 1);
+    if (low)  atomicAdd(&counts[1], 1);
+    if (peak_low) atomicAdd(&counts[2], 1);  // "both" = peak below threshold
+
+    freezeCand[i] = peak_low ? 1 : 0;
 }
 
 // ─── Same as above but only first n_neighbors_stable neighbors count for "same" (K_stable <= K) ───
