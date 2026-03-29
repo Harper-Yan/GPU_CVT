@@ -1,6 +1,7 @@
 #include "site_normals.cuh"
-#include "site_knn.cuh"
+#include "spatial.cuh"
 #include "2dClip.cuh"
+#include "site_knn.cuh"
 #include "near_project.cuh"
 #include "freezetest.cuh"
 #include "buildmesh.cuh"
@@ -15,11 +16,11 @@
 #include <vector>
 #include <algorithm>
 
-// ─── Mode 1: 5-tier (nv only). Same params as mode 2: uniform disp_thr, streak 10+5*tier ─
+// ─── Mode 1: 5-tier (nv only). Same params as mode 2: uniform disp_thr, streak 10+5*tier (+5 to original) ─
 namespace tier1 {
     static const double TIER_THRESHOLDS[4] = {0.15, 0.35, 0.55, 0.80};
     static const float DISP_THR[5]  = {1e-3f, 1e-3f, 1e-3f, 1e-3f, 1e-3f};
-    static const int   STREAK[5]    = {5, 10, 15, 20, 25};
+    static const int   STREAK[5]    = {10, 15, 20, 25, 30};  // +5 to original 5,10,15,20,25
 
     static void compute_tier_id_v1(int nV, const std::vector<double>& nv, std::vector<unsigned char>& tier_id) {
         tier_id.resize((size_t)nV);
@@ -36,7 +37,7 @@ namespace tier2 {
     static const double TIER_THRESHOLDS[4] = {0.15, 0.35, 0.55, 0.80};
     static const double L_SHARP_THR = 0.80;
     static const float DISP_THR[6]  = {1e-3f, 1e-3f, 1e-3f, 1e-3f, 1e-3f, 1e-3f};
-    static const int   STREAK[6]    = {5, 10, 15, 20, 25, 10};  // tier 4 (sharp_B, less L) stricter; tier 5 (sharp_A, more L) looser (streak 10)
+    static const int   STREAK[6]    = {10, 15, 20, 25, 30, 15};  // +5 to original; tier 4 stricter, tier 5 looser
 
     static void normal_variation_score(int nV, int k, const float* hN, const idx_t* hKNN, std::vector<double>& nv_out) {
         nv_out.resize((size_t)nV);
@@ -382,16 +383,16 @@ int main(int argc, char** argv)
     if (argc >= 3) mode = std::atoi(argv[2]);
 
     // modes:
-    // 0: baseline (gpu_cvt)         - dFrozen computed then cleared each iter
-    // 1: freezing_cvt               - 5-tier freeze (testfreeze.py params)
-    // 2: freezing_cvt_tiered       - 6-tier freeze (testfreeze2.py, sharp split by L)
-    const char* mode_name = (mode == 0) ? "baseline" : (mode == 2 ? "freezing_cvt_tiered" : "freezing_cvt");
+    // 0: baseline (brute-force KNN, no freeze)
+    // 1: bitonic_only (bitonic KNN, no freeze — ablation)
+    // 2: freezing_cvt (bitonic KNN + 5-tier freeze)
+    const char* mode_name = (mode == 0) ? "baseline" : (mode == 1 ? "bitonic_only" : "freezing_cvt");
     printf("mode %d (%s)\n", mode, mode_name);
 
     // ---------------- Tunable constants ----------------
     constexpr int   THREADS        = 1024;
     constexpr int   MAX_POLY        = 256;
-    constexpr int   KPROJ           = 5;
+    constexpr int   KPROJ           = 10;
     constexpr int   DUMP_STRIDE     = 10;     // dump an .obj and eval row every N iters
     constexpr float DEGENERATE_EPS  = 1e-6f; // degenerate-triangle test epsilon
 
@@ -405,6 +406,8 @@ int main(int argc, char** argv)
     const bool use_geogram = true;
 
     int freeze_monitor_iters = 5;
+    // Neighbor stability: 0 = use all K_NEIGH neighbors for "same"; 1..K_NEIGH-1 = use only first N for stability (e.g. 10).
+    int freeze_k_stable = 0;  // 0 = use all K_NEIGH for stability; 1..K_NEIGH-1 = first N only (Kstable).
     // freeze_disp = squared displacement threshold, set below from mesh bbox (0.01 * max bbox edge)^2
     float freeze_disp = 0.0f;
     // ----------------------------------------------------
@@ -560,14 +563,18 @@ int main(int argc, char** argv)
     float* d_thresh2_tier = nullptr;
     int* d_streak_tier = nullptr;
     if (mode == 1) {
+        // Mode 1 (bitonic_only): uses bitonic KNN path but no freezing.
+        // Allocate tier arrays to keep code paths happy, but they won't trigger freezing
+        // because dFrozen is cleared every iteration (see below).
         cudaMalloc(&d_tier_id, (size_t)nV);
+        cudaMemset(d_tier_id, 0, (size_t)nV);
         cudaMalloc(&d_thresh2_tier, 6 * sizeof(float));
         cudaMalloc(&d_streak_tier, 6 * sizeof(int));
         float h_thresh2[6];
         int h_streak[6];
         for (int t = 0; t < 6; ++t) {
-            h_thresh2[t] = freeze_disp;  // same freeze_disp (squared) for all tiers
-            h_streak[t] = (t < 5) ? tier1::STREAK[t] : tier1::STREAK[4];
+            h_thresh2[t] = freeze_disp;
+            h_streak[t] = 999999;  // effectively infinite — no site will ever freeze
         }
         cudaMemcpy(d_thresh2_tier, h_thresh2, 6 * sizeof(float), cudaMemcpyHostToDevice);
         cudaMemcpy(d_streak_tier, h_streak, 6 * sizeof(int), cudaMemcpyHostToDevice);
@@ -576,11 +583,23 @@ int main(int argc, char** argv)
         cudaMalloc(&d_thresh2_tier, 6 * sizeof(float));
         cudaMalloc(&d_streak_tier, 6 * sizeof(int));
         float h_thresh2[6];
+        int h_streak[6];
+        // Scale streak inversely with mesh density: denser meshes change more slowly
+        // per iteration, so shorter streaks provide equivalent confidence.
+        // Reference: 50K vertices (calibration meshes). Scale as (N_ref/N)^0.3
+        const double N_ref = 50000.0;
+        double scale = std::pow(N_ref / (double)nV, 0.3);
+        if (scale > 1.0) scale = 1.0;  // never increase streak beyond base
+        printf("density-scaled streak: scale=%.3f (nV=%d, N_ref=%.0f)\n", scale, nV, N_ref);
         for (int t = 0; t < 6; ++t) {
-            h_thresh2[t] = freeze_disp;  // same freeze_disp (squared) for all tiers
+            int base = (t < 5) ? tier1::STREAK[t] : tier1::STREAK[4];
+            h_streak[t] = std::max(2, (int)std::round(base * scale));
+            h_thresh2[t] = freeze_disp;
         }
+        printf("scaled streaks: [%d, %d, %d, %d, %d, %d]\n",
+               h_streak[0], h_streak[1], h_streak[2], h_streak[3], h_streak[4], h_streak[5]);
         cudaMemcpy(d_thresh2_tier, h_thresh2, 6 * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_streak_tier, tier2::STREAK, 6 * sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_streak_tier, h_streak, 6 * sizeof(int), cudaMemcpyHostToDevice);
     }
 
     std::vector<unsigned char> hFrozen(nV);
@@ -618,7 +637,7 @@ int main(int argc, char** argv)
 
     float total_remesh_ms = 0.0f;
 
-    const char* root_dir = (mode == 0) ? "gpucvt" : (mode == 2 ? "freeze_tiered" : "freeze");
+    const char* root_dir = (mode == 0) ? "gpucvt" : (mode == 1 ? "bitonic_only" : "freeze");
     const std::string output_base = "experiments/output";
     std::string out_dir = output_base + "/" + root_dir + "/" + mesh_name;
     std::filesystem::create_directories(out_dir);
@@ -638,6 +657,12 @@ int main(int argc, char** argv)
     }
 
     if (mode == 1) {
+        // Mode 1 (bitonic_only): warm up bitonic KNN but skip tier assignment.
+        run_knn_bitonic_hubs(nV, K_SITE, dFrozen, dS, dKNN_sites_raw, dDist_sites_raw);
+        knn_drop_self_kernel<K_SITE, K_NEIGH, idx_t><<<grd, blk>>>(dKNN_sites_raw, dKNN_sites, nV);
+        cudaDeviceSynchronize();
+        printf("mode 1: bitonic_only (no freeze, no tier assignment)\n");
+    } else if (mode == 2) {
         run_knn_bitonic_hubs(nV, K_SITE, dFrozen, dS, dKNN_sites_raw, dDist_sites_raw);
         knn_drop_self_kernel<K_SITE, K_NEIGH, idx_t><<<grd, blk>>>(dKNN_sites_raw, dKNN_sites, nV);
         cudaDeviceSynchronize();
@@ -650,32 +675,44 @@ int main(int argc, char** argv)
         std::vector<unsigned char> h_tier_id;
         tier1::compute_tier_id_v1(nV, h_nv, h_tier_id);
         cudaMemcpy(d_tier_id, h_tier_id.data(), (size_t)nV, cudaMemcpyHostToDevice);
-        printf("mode 1: tier assignment done (5-tier, testfreeze.py)\n");
-    } else if (mode == 2) {
-        run_knn_bitonic_hubs(nV, K_SITE, dFrozen, dS, dKNN_sites_raw, dDist_sites_raw);
-        knn_drop_self_kernel<K_SITE, K_NEIGH, idx_t><<<grd, blk>>>(dKNN_sites_raw, dKNN_sites, nV);
-        cudaDeviceSynchronize();
-        std::vector<idx_t> hKNN((size_t)nV * K_NEIGH);
-        std::vector<float> hN((size_t)nV * 3);
-        cudaMemcpy(hKNN.data(), dKNN_sites, (size_t)nV * K_NEIGH * sizeof(idx_t), cudaMemcpyDeviceToHost);
-        cudaMemcpy(hN.data(), dN, (size_t)nV * sizeof(float3), cudaMemcpyDeviceToHost);
-        std::vector<double> h_nv, h_L;
-        std::vector<unsigned char> h_tier_id;
-        tier2::compute_tier_id_v2(nV, K_NEIGH, hN.data(), hKNN.data(), h_nv, h_L, h_tier_id);
-        cudaMemcpy(d_tier_id, h_tier_id.data(), (size_t)nV, cudaMemcpyHostToDevice);
-        printf("mode 2: tier assignment done (6-tier, testfreeze2.py sharp split by L)\n");
+        printf("mode 2: tier assignment done (5-tier freeze)\n");
     }
+    if (mode != 0) {
+        if (freeze_k_stable > 0 && freeze_k_stable < K_NEIGH)
+            printf("freeze stability: first %d neighbors (K_stable)\n", freeze_k_stable);
+        else
+            printf("freeze stability: all %d neighbors\n", K_NEIGH);
+    }
+
+    // Running buffers for 10-iter average of kernel/iter times (written to CSV at dump iters)
+    std::vector<float> buf_iter_remesh(DUMP_STRIDE, 0.f);
+    std::vector<float> buf_knn_sites(DUMP_STRIDE, 0.f);
+    std::vector<float> buf_knn_site_to_mesh(DUMP_STRIDE, 0.f);
+    std::vector<float> buf_uv(DUMP_STRIDE, 0.f);
+    std::vector<float> buf_centroids(DUMP_STRIDE, 0.f);
+    std::vector<float> buf_knn_centroid_to_mesh(DUMP_STRIDE, 0.f);
+    std::vector<float> buf_project(DUMP_STRIDE, 0.f);
+    std::vector<float> buf_freeze(DUMP_STRIDE, 0.f);
+
+    // Qavg history for early stop when Qavg (mode 0) does not move much
+    std::vector<float> qavg_history;
+    const float QAVG_STABLE_EPS = 0.f;  // 0 = no early stop; >0 = stop when Qavg max |diff| in window < this
+    const int QAVG_STABLE_WINDOW = 10;
+    bool terminate_early = false;
 
     for (int iter = 0; iter < total_iter; ++iter)
     {
         printf("\n=== iter %d ===\n", iter);
 
-        float knn_sites_ms = run_knn_bitonic_hubs(nV, K_SITE, dFrozen, dS, dKNN_sites_raw, dDist_sites_raw);
-        printf("knn_sites_ms %.3f\n", knn_sites_ms);
-
-        knn_drop_self_kernel<K_SITE, K_NEIGH, idx_t><<<grd, blk>>>(dKNN_sites_raw, dKNN_sites, nV);
-        if (mode != 0)
+        float knn_sites_ms;
+        if (mode == 0) {
+            knn_sites_ms = run_knn_sites_bruteforce<K_NEIGH>(nV, dFrozen, dS, dKNN_sites);
+        } else {
+            knn_sites_ms = run_knn_bitonic_hubs(nV, K_SITE, dFrozen, dS, dKNN_sites_raw, dDist_sites_raw);
+            knn_drop_self_kernel<K_SITE, K_NEIGH, idx_t><<<grd, blk>>>(dKNN_sites_raw, dKNN_sites, nV);
             restore_prev_knn_for_frozen_kernel<K_NEIGH, idx_t><<<grd, blk>>>(dFrozen, dPrevKNN_sites, dKNN_sites, nV);
+        }
+        printf("knn_sites_ms %.3f\n", knn_sites_ms);
 
         float knn_site_to_mesh_ms = 0.0f;
         float knn_centroid_to_mesh_ms = 0.0f;
@@ -771,30 +808,61 @@ int main(int argc, char** argv)
         cudaMemset(dFreezeCand, 0, (size_t)nV); // pass-1 candidates (this iter only)
 
         cudaEventRecord(e0);
+        bool use_k_stable = (freeze_k_stable > 0 && freeze_k_stable < K_NEIGH);
         if (mode == 1 || mode == 2) {
-            freeze_test_kernel_streak_tiered<K_NEIGH, idx_t><<<grd, blk>>>(
-                dS, dSnew,
-                dKNN_sites, dPrevKNN_sites,
-                dFreezeCand,
-                dFreezeStreak,
-                d_tier_id,
-                d_thresh2_tier,
-                d_streak_tier,
-                nV,
-                has_prev_knn,
-                dCounts
-            );
+            if (use_k_stable) {
+                freeze_test_kernel_streak_tiered_Kstable<K_NEIGH, idx_t><<<grd, blk>>>(
+                    dS, dSnew,
+                    dKNN_sites, dPrevKNN_sites,
+                    dFreezeCand,
+                    dFreezeStreak,
+                    d_tier_id,
+                    d_thresh2_tier,
+                    d_streak_tier,
+                    nV,
+                    has_prev_knn,
+                    freeze_k_stable,
+                    dCounts
+                );
+            } else {
+                freeze_test_kernel_streak_tiered<K_NEIGH, idx_t><<<grd, blk>>>(
+                    dS, dSnew,
+                    dKNN_sites, dPrevKNN_sites,
+                    dFreezeCand,
+                    dFreezeStreak,
+                    d_tier_id,
+                    d_thresh2_tier,
+                    d_streak_tier,
+                    nV,
+                    has_prev_knn,
+                    dCounts
+                );
+            }
         } else {
-            freeze_test_kernel_streak<K_NEIGH, idx_t><<<grd, blk>>>(
-                dS, dSnew,
-                dKNN_sites, dPrevKNN_sites,
-                dFreezeCand,
-                dFreezeStreak,
-                freeze_disp, nV,
-                has_prev_knn,
-                freeze_monitor_iters,
-                dCounts
-            );
+            if (use_k_stable) {
+                freeze_test_kernel_streak_Kstable<K_NEIGH, idx_t><<<grd, blk>>>(
+                    dS, dSnew,
+                    dKNN_sites, dPrevKNN_sites,
+                    dFreezeCand,
+                    dFreezeStreak,
+                    freeze_disp, nV,
+                    has_prev_knn,
+                    freeze_monitor_iters,
+                    freeze_k_stable,
+                    dCounts
+                );
+            } else {
+                freeze_test_kernel_streak<K_NEIGH, idx_t><<<grd, blk>>>(
+                    dS, dSnew,
+                    dKNN_sites, dPrevKNN_sites,
+                    dFreezeCand,
+                    dFreezeStreak,
+                    freeze_disp, nV,
+                    has_prev_knn,
+                    freeze_monitor_iters,
+                    dCounts
+                );
+            }
         }
         freeze_apply_cand_kernel<<<grd, blk>>>(dFreezeCand, dFrozen, nV, dCounts);
         cudaEventRecord(e1);
@@ -805,6 +873,16 @@ int main(int argc, char** argv)
         float iter_remesh_ms = knn_sites_ms + knn_site_to_mesh_ms + uv_from_mesh_ms + centroids_ms + knn_centroid_to_mesh_ms + project_ms;
         total_remesh_ms += iter_remesh_ms;
         printf("iter_remesh_ms %.3f (total_remesh_ms %.3f)\n", iter_remesh_ms, total_remesh_ms);
+
+        int slot = iter % DUMP_STRIDE;
+        buf_iter_remesh[slot] = iter_remesh_ms;
+        buf_knn_sites[slot] = knn_sites_ms;
+        buf_knn_site_to_mesh[slot] = knn_site_to_mesh_ms;
+        buf_uv[slot] = uv_from_mesh_ms;
+        buf_centroids[slot] = centroids_ms;
+        buf_knn_centroid_to_mesh[slot] = knn_centroid_to_mesh_ms;
+        buf_project[slot] = project_ms;
+        buf_freeze[slot] = freeze_ms;
 
         int hCounts[4] = {0,0,0,0};
         cudaMemcpy(hCounts, dCounts, 4 * sizeof(int), cudaMemcpyDeviceToHost);
@@ -839,8 +917,9 @@ int main(int argc, char** argv)
             cudaMemcpy(hFrozenIter.data(), dFrozen, (size_t)nV, cudaMemcpyDeviceToHost);
         }
 
-        // Baseline mode computes dFrozen but clears it every iteration to avoid freezing.
-        if (mode == 0) {
+        // Modes 0 and 1 compute dFrozen but clear it every iteration to avoid freezing.
+        // Mode 0 = brute-force KNN, no freeze; Mode 1 = bitonic KNN, no freeze.
+        if (mode == 0 || mode == 1) {
             cudaMemset(dFrozen, 0, (size_t)nV);
             cudaMemset(dFreezeStreak, 0, (size_t)nV);
         }
@@ -880,7 +959,13 @@ int main(int argc, char** argv)
         dS = dSnew;
         dSnew = tmp;
 
-        run_knn_bitonic_hubs(nV, K_SITE, dFrozen, dS, dKNN_sites_raw, dDist_sites_raw);
+        if (mode == 0) {
+            run_knn_sites_bruteforce<K_NEIGH>(nV, dFrozen, dS, dKNN_sites);
+        } else {
+            run_knn_bitonic_hubs(nV, K_SITE, dFrozen, dS, dKNN_sites_raw, dDist_sites_raw);
+            knn_drop_self_kernel<K_SITE, K_NEIGH, idx_t><<<grd, blk>>>(dKNN_sites_raw, dKNN_sites, nV);
+            restore_prev_knn_for_frozen_kernel<K_NEIGH, idx_t><<<grd, blk>>>(dFrozen, dPrevKNN_sites, dKNN_sites, nV);
+        }
 
         if (mode != 0) {
             cudaMemcpy(dPrevKnnV, dKnnV, (size_t)nV * KPROJ * sizeof(int), cudaMemcpyDeviceToDevice);
@@ -1008,6 +1093,20 @@ int main(int argc, char** argv)
             float Qmin, Qavg, theta_min, theta_min_avg, theta_lt_30_pct, theta_gt_90_pct;
             eval_quality_angles_cpu(hV_dump, hFcand, Qmin, Qavg, theta_min, theta_min_avg, theta_lt_30_pct, theta_gt_90_pct);
 
+            if (mode == 0) {
+                qavg_history.push_back(Qavg);
+                if ((int)qavg_history.size() >= QAVG_STABLE_WINDOW) {
+                    float max_diff = 0.f;
+                    for (int i = (int)qavg_history.size() - QAVG_STABLE_WINDOW; i + 1 < (int)qavg_history.size(); ++i)
+                        max_diff = std::max(max_diff, std::abs(qavg_history[i + 1] - qavg_history[i]));
+                    if (max_diff < QAVG_STABLE_EPS) {
+                        terminate_early = true;
+                        printf("Qavg stable (max diff %.2e < %.2e), stopping early at iter %d\n",
+                            (double)max_diff, (double)QAVG_STABLE_EPS, iter);
+                    }
+                }
+            }
+
             size_t nVc = hV_dump.size();
             size_t nFc = hFcand.size();
 
@@ -1037,6 +1136,22 @@ int main(int argc, char** argv)
 
             std::string eval_path = out_dir + "/eval_iters.csv";
 
+            int n_avg = (iter < DUMP_STRIDE) ? (iter + 1) : DUMP_STRIDE;
+            float avg_iter_remesh = 0.f, avg_knn_sites = 0.f, avg_knn_site_to_mesh = 0.f, avg_uv = 0.f;
+            float avg_centroids = 0.f, avg_knn_centroid_to_mesh = 0.f, avg_project = 0.f, avg_freeze = 0.f;
+            for (int i = 0; i < n_avg; ++i) {
+                avg_iter_remesh += buf_iter_remesh[i];
+                avg_knn_sites += buf_knn_sites[i];
+                avg_knn_site_to_mesh += buf_knn_site_to_mesh[i];
+                avg_uv += buf_uv[i];
+                avg_centroids += buf_centroids[i];
+                avg_knn_centroid_to_mesh += buf_knn_centroid_to_mesh[i];
+                avg_project += buf_project[i];
+                avg_freeze += buf_freeze[i];
+            }
+            avg_iter_remesh /= n_avg; avg_knn_sites /= n_avg; avg_knn_site_to_mesh /= n_avg; avg_uv /= n_avg;
+            avg_centroids /= n_avg; avg_knn_centroid_to_mesh /= n_avg; avg_project /= n_avg; avg_freeze /= n_avg;
+
             append_eval_iters_csv(
                 eval_path,
                 mesh_name,
@@ -1046,17 +1161,17 @@ int main(int argc, char** argv)
                 theta_min, theta_min_avg,
                 theta_lt_30_pct, theta_gt_90_pct,
                 dH,
-                iter_remesh_ms,
+                avg_iter_remesh,
                 total_remesh_ms,
                 hFrozenSum,
                 nV,
-                knn_sites_ms,
-                knn_site_to_mesh_ms,
-                uv_from_mesh_ms,
-                centroids_ms,
-                knn_centroid_to_mesh_ms,
-                project_ms,
-                freeze_ms,
+                avg_knn_sites,
+                avg_knn_site_to_mesh,
+                avg_uv,
+                avg_centroids,
+                avg_knn_centroid_to_mesh,
+                avg_project,
+                avg_freeze,
                 hCounts[0],
                 hCounts[1],
                 hCounts[2],
@@ -1069,13 +1184,13 @@ int main(int argc, char** argv)
         final_converge_rate = last_frozenRatio;
         final_nf = use_geogram ? last_geogram_nf : (int)hFnew.size();
 
-        //if (terminate_now) break;
+        if (terminate_early) break;
     }
 
     printf("\nTotal remeshing time (mesh rebuilding excluded): %.3f ms\n", total_remesh_ms);
 
     {
-        const char* mode_str = (mode == 0) ? "gpucvt" : (mode == 2 ? "freeze_tiered" : "freeze");
+        const char* mode_str = (mode == 0) ? "gpucvt" : (mode == 1 ? "bitonic_only" : "freeze");
         append_run_csv("experiments/runs.csv", mesh_name, mode_str, nV, final_nf, final_converge_rate, used_iters, total_remesh_ms);
     }
 

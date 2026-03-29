@@ -9,6 +9,40 @@ float f3_len2(const float3 a)
     return f3_dot(a, a);
 }
 
+/** Site-site K-NN by bruteforce: each of n points finds K nearest in the same set (excluding self). */
+template<int K, typename IdxT>
+__global__ void knn_sites_bruteforce_kernel(const float3* __restrict__ pts, int n,
+                                            const unsigned char* __restrict__ frozen,
+                                            IdxT* __restrict__ out_knn)
+{
+    int qi = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (qi >= n) return;
+    if (frozen && frozen[qi]) return;
+
+    float3 q = pts[qi];
+    float best_d2[K];
+    int   best_i[K];
+    for (int t = 0; t < K; ++t) { best_d2[t] = 1e30f; best_i[t] = -1; }
+
+    for (int j = 0; j < n; ++j) {
+        if (j == qi) continue;
+        float3 d = f3_sub(pts[j], q);
+        float d2 = f3_len2(d);
+        if (d2 >= best_d2[K - 1]) continue;
+        int pos = K - 1;
+        best_d2[pos] = d2;
+        best_i[pos] = j;
+        while (pos > 0 && best_d2[pos] < best_d2[pos - 1]) {
+            float td = best_d2[pos - 1]; best_d2[pos - 1] = best_d2[pos]; best_d2[pos] = td;
+            int   ti = best_i[pos - 1];  best_i[pos - 1] = best_i[pos];  best_i[pos] = ti;
+            --pos;
+        }
+    }
+
+    int base = qi * K;
+    for (int t = 0; t < K; ++t) out_knn[base + t] = (IdxT)best_i[t];
+}
+
 __device__ __forceinline__ float3 closest_point_tri(float3 P, float3 A, float3 B, float3 C){
     float3 AB = f3_sub(B,A);
     float3 AC = f3_sub(C,A);

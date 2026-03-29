@@ -603,6 +603,50 @@ __device__ int get_assignment_another_cell(const float q_xyz[3], int cell, idx_t
     return best_hub_idx;
 }
 
+__device__ void load_hub_coords_smem(int cell, idx_t** __restrict__ dH, float** __restrict__ data,
+    float* shared_hx, float* shared_hy, float* shared_hz) {
+    int lane_id = threadIdx.x;
+    for (int i = lane_id; i < H; i += warp_size) {
+        idx_t hub_idx = dH[cell][i];
+        shared_hx[i] = data[cell][hub_idx * 3 + 0];
+        shared_hy[i] = data[cell][hub_idx * 3 + 1];
+        shared_hz[i] = data[cell][hub_idx * 3 + 2];
+    }
+    __syncwarp();
+}
+
+__device__ int get_assignment_smem(const float q_xyz[3],
+    const float* shared_hx, const float* shared_hy, const float* shared_hz) {
+    int lane_id = threadIdx.x;
+
+    int best_hub_idx = -1;
+    float best_dist = FLT_MAX;
+
+    for (int i = lane_id; i < H; i += warp_size) {
+        float dx = q_xyz[0] - shared_hx[i];
+        float dy = q_xyz[1] - shared_hy[i];
+        float dz = q_xyz[2] - shared_hz[i];
+        float dist = dx * dx + dy * dy + dz * dz;
+        if (dist < best_dist) {
+            best_dist = dist;
+            best_hub_idx = i;
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        float other_dist = __shfl_down_sync(0xffffffff, best_dist, offset);
+        int other_idx  = __shfl_down_sync(0xffffffff, best_hub_idx, offset);
+        if (other_dist < best_dist) {
+            best_dist = other_dist;
+            best_hub_idx = other_idx;
+        }
+    }
+    best_hub_idx = __shfl_sync(0xffffffff, best_hub_idx, 0);
+
+    return best_hub_idx;
+}
+
 //-----------------Query kernel for Grid-related version
 template <std::size_t ROUNDS>
 __device__ void query_own_cell(
@@ -1029,6 +1073,11 @@ void QueryWithPoints( int stream_id, int K, int* __restrict__ query_cell_counts,
     const unsigned char* __restrict__ frozen
 )
 {
+    extern __shared__ float smem_hub[];
+    float* shared_hx = smem_hub;
+    float* shared_hy = smem_hub + H;
+    float* shared_hz = smem_hub + 2 * H;
+
     int const lane_id           = threadIdx.x;
     int const query_id_in_block = threadIdx.y;
     int const queries_per_block = blockDim.y;
@@ -1038,14 +1087,16 @@ void QueryWithPoints( int stream_id, int K, int* __restrict__ query_cell_counts,
 
     if( query_sequence_id >= n_stream ) { return; }
 
-    idx_t const global_query_id = query_cell_list[query_cell_psum[stream_id] + query_sequence_id];
+    int sorted_idx = query_cell_psum[stream_id] + query_sequence_id;
+    idx_t const global_query_id = query_cell_list[sorted_idx];
     // Skip query for frozen site (caller keeps prev K-NN for frozen).
     if (frozen && frozen[global_query_id]) { return; }
 
+    // Read from pre-sorted (by cell) query coordinates — coalesced access
     float q_xyz[3] = {
-        query_points[global_query_id * 3 + 0],
-        query_points[global_query_id * 3 + 1],
-        query_points[global_query_id * 3 + 2]
+        query_points[sorted_idx * 3 + 0],
+        query_points[sorted_idx * 3 + 1],
+        query_points[sorted_idx * 3 + 2]
     };
 
     idx_t best_point_id[ROUNDS];
@@ -1060,7 +1111,9 @@ void QueryWithPoints( int stream_id, int K, int* __restrict__ query_cell_counts,
     idx_t const round_K = ROUNDS - 1;
     int cell = stream_id;
 
-    int hub_containing_qp = get_assignment_another_cell(q_xyz, cell, dH, data);
+    // Load hub coords into shared memory, then assign via smem
+    load_hub_coords_smem(cell, dH, data, shared_hx, shared_hy, shared_hz);
+    int hub_containing_qp = get_assignment_smem(q_xyz, shared_hx, shared_hy, shared_hz);
     idx_t* global_idx_current_cell = sorted_global_idx + cell_psum[cell];
 
     query_own_cell<ROUNDS>(
@@ -1093,7 +1146,8 @@ void QueryWithPoints( int stream_id, int K, int* __restrict__ query_cell_counts,
             if (distance_to_cell_aabb(q_xyz, &cell_mins[i * dim], &cell_maxs[i * dim], dim) > sqrt(kth_distance)) {
                 continue;
             }
-            hub_containing_qp = get_assignment_another_cell(q_xyz, i, dH, data);
+            load_hub_coords_smem(i, dH, data, shared_hx, shared_hy, shared_hz);
+            hub_containing_qp = get_assignment_smem(q_xyz, shared_hx, shared_hy, shared_hz);
             global_idx_current_cell = sorted_global_idx + cell_psum[i];
             query_cell<ROUNDS>(
                 i,
@@ -1463,8 +1517,16 @@ void C_and_Q(std::size_t n, R *data, std::size_t q, idx_t *queries, std::size_t 
                 int pos = h_query_cell_psum[bin_id] + cell_offset[bin_id]++;
                 h_query_cell_list[pos] = (idx_t)j;
             }
+            // Pre-sort query coordinates by cell for coalesced GPU access
+            std::vector<float> sorted_qp(q * 3);
+            for (std::size_t pos = 0; pos < q; ++pos) {
+                idx_t orig = h_query_cell_list[pos];
+                sorted_qp[pos * 3 + 0] = query_points[orig * 3 + 0];
+                sorted_qp[pos * 3 + 1] = query_points[orig * 3 + 1];
+                sorted_qp[pos * 3 + 2] = query_points[orig * 3 + 2];
+            }
             CUDA_CALL(cudaMalloc((void**)&d_query_points, sizeof(R) * q * 3));
-            CUDA_CALL(cudaMemcpy(d_query_points, query_points, sizeof(R) * q * 3, cudaMemcpyHostToDevice));
+            CUDA_CALL(cudaMemcpy(d_query_points, sorted_qp.data(), sizeof(R) * q * 3, cudaMemcpyHostToDevice));
             CUDA_CALL(cudaMalloc((void**)&d_query_cell_psum, sizeof(int) * (num_cells + 1)));
             CUDA_CALL(cudaMemcpy(d_query_cell_psum, h_query_cell_psum.data(), sizeof(int) * (num_cells + 1), cudaMemcpyHostToDevice));
             CUDA_CALL(cudaMalloc((void**)&d_query_cell_list, sizeof(idx_t) * q));
@@ -1491,14 +1553,14 @@ void C_and_Q(std::size_t n, R *data, std::size_t q, idx_t *queries, std::size_t 
                 if (n_stream == 0) continue;
                 int num_blocks = util::CEIL_DIV(n_stream, (int)queries_per_block);
                 switch (util::CEIL_DIV(k, warp_size)) {
-                    case 1: QueryWithPoints<1><<<num_blocks, dim3{warp_size, (int)queries_per_block, 1}, 0, streams[i]>>>(i, k, d_query_cell_counts, d_bin_counts, d_query_points, d_query_cell_psum, d_query_cell_list, results_distances, results_knn, d_arr_idx_arr, d_sorted_idx, d_arr_x_arr, d_arr_y_arr, d_arr_z_arr, d_data_chunks, d_dH, d_dH_psum, d_cell_psum, d_D_arr, d_iD_arr, d_dD_arr, d_cell_maxs, d_cell_mins, d_hubsScanned, d_pointsScanned, num_cells, frozen); break;
-                    case 2: QueryWithPoints<2><<<num_blocks, dim3{warp_size, (int)queries_per_block, 1}, 0, streams[i]>>>(i, k, d_query_cell_counts, d_bin_counts, d_query_points, d_query_cell_psum, d_query_cell_list, results_distances, results_knn, d_arr_idx_arr, d_sorted_idx, d_arr_x_arr, d_arr_y_arr, d_arr_z_arr, d_data_chunks, d_dH, d_dH_psum, d_cell_psum, d_D_arr, d_iD_arr, d_dD_arr, d_cell_maxs, d_cell_mins, d_hubsScanned, d_pointsScanned, num_cells, frozen); break;
-                    case 3: QueryWithPoints<3><<<num_blocks, dim3{warp_size, (int)queries_per_block, 1}, 0, streams[i]>>>(i, k, d_query_cell_counts, d_bin_counts, d_query_points, d_query_cell_psum, d_query_cell_list, results_distances, results_knn, d_arr_idx_arr, d_sorted_idx, d_arr_x_arr, d_arr_y_arr, d_arr_z_arr, d_data_chunks, d_dH, d_dH_psum, d_cell_psum, d_D_arr, d_iD_arr, d_dD_arr, d_cell_maxs, d_cell_mins, d_hubsScanned, d_pointsScanned, num_cells, frozen); break;
-                    case 4: QueryWithPoints<4><<<num_blocks, dim3{warp_size, (int)queries_per_block, 1}, 0, streams[i]>>>(i, k, d_query_cell_counts, d_bin_counts, d_query_points, d_query_cell_psum, d_query_cell_list, results_distances, results_knn, d_arr_idx_arr, d_sorted_idx, d_arr_x_arr, d_arr_y_arr, d_arr_z_arr, d_data_chunks, d_dH, d_dH_psum, d_cell_psum, d_D_arr, d_iD_arr, d_dD_arr, d_cell_maxs, d_cell_mins, d_hubsScanned, d_pointsScanned, num_cells, frozen); break;
-                    case 5: QueryWithPoints<5><<<num_blocks, dim3{warp_size, (int)queries_per_block, 1}, 0, streams[i]>>>(i, k, d_query_cell_counts, d_bin_counts, d_query_points, d_query_cell_psum, d_query_cell_list, results_distances, results_knn, d_arr_idx_arr, d_sorted_idx, d_arr_x_arr, d_arr_y_arr, d_arr_z_arr, d_data_chunks, d_dH, d_dH_psum, d_cell_psum, d_D_arr, d_iD_arr, d_dD_arr, d_cell_maxs, d_cell_mins, d_hubsScanned, d_pointsScanned, num_cells, frozen); break;
-                    case 6: QueryWithPoints<6><<<num_blocks, dim3{warp_size, (int)queries_per_block, 1}, 0, streams[i]>>>(i, k, d_query_cell_counts, d_bin_counts, d_query_points, d_query_cell_psum, d_query_cell_list, results_distances, results_knn, d_arr_idx_arr, d_sorted_idx, d_arr_x_arr, d_arr_y_arr, d_arr_z_arr, d_data_chunks, d_dH, d_dH_psum, d_cell_psum, d_D_arr, d_iD_arr, d_dD_arr, d_cell_maxs, d_cell_mins, d_hubsScanned, d_pointsScanned, num_cells, frozen); break;
-                    case 7: QueryWithPoints<7><<<num_blocks, dim3{warp_size, (int)queries_per_block, 1}, 0, streams[i]>>>(i, k, d_query_cell_counts, d_bin_counts, d_query_points, d_query_cell_psum, d_query_cell_list, results_distances, results_knn, d_arr_idx_arr, d_sorted_idx, d_arr_x_arr, d_arr_y_arr, d_arr_z_arr, d_data_chunks, d_dH, d_dH_psum, d_cell_psum, d_D_arr, d_iD_arr, d_dD_arr, d_cell_maxs, d_cell_mins, d_hubsScanned, d_pointsScanned, num_cells, frozen); break;
-                    case 8: QueryWithPoints<8><<<num_blocks, dim3{warp_size, (int)queries_per_block, 1}, 0, streams[i]>>>(i, k, d_query_cell_counts, d_bin_counts, d_query_points, d_query_cell_psum, d_query_cell_list, results_distances, results_knn, d_arr_idx_arr, d_sorted_idx, d_arr_x_arr, d_arr_y_arr, d_arr_z_arr, d_data_chunks, d_dH, d_dH_psum, d_cell_psum, d_D_arr, d_iD_arr, d_dD_arr, d_cell_maxs, d_cell_mins, d_hubsScanned, d_pointsScanned, num_cells, frozen); break;
+                    case 1: QueryWithPoints<1><<<num_blocks, dim3{warp_size, (int)queries_per_block, 1}, 3 * H * sizeof(float), streams[i]>>>(i, k, d_query_cell_counts, d_bin_counts, d_query_points, d_query_cell_psum, d_query_cell_list, results_distances, results_knn, d_arr_idx_arr, d_sorted_idx, d_arr_x_arr, d_arr_y_arr, d_arr_z_arr, d_data_chunks, d_dH, d_dH_psum, d_cell_psum, d_D_arr, d_iD_arr, d_dD_arr, d_cell_maxs, d_cell_mins, d_hubsScanned, d_pointsScanned, num_cells, frozen); break;
+                    case 2: QueryWithPoints<2><<<num_blocks, dim3{warp_size, (int)queries_per_block, 1}, 3 * H * sizeof(float), streams[i]>>>(i, k, d_query_cell_counts, d_bin_counts, d_query_points, d_query_cell_psum, d_query_cell_list, results_distances, results_knn, d_arr_idx_arr, d_sorted_idx, d_arr_x_arr, d_arr_y_arr, d_arr_z_arr, d_data_chunks, d_dH, d_dH_psum, d_cell_psum, d_D_arr, d_iD_arr, d_dD_arr, d_cell_maxs, d_cell_mins, d_hubsScanned, d_pointsScanned, num_cells, frozen); break;
+                    case 3: QueryWithPoints<3><<<num_blocks, dim3{warp_size, (int)queries_per_block, 1}, 3 * H * sizeof(float), streams[i]>>>(i, k, d_query_cell_counts, d_bin_counts, d_query_points, d_query_cell_psum, d_query_cell_list, results_distances, results_knn, d_arr_idx_arr, d_sorted_idx, d_arr_x_arr, d_arr_y_arr, d_arr_z_arr, d_data_chunks, d_dH, d_dH_psum, d_cell_psum, d_D_arr, d_iD_arr, d_dD_arr, d_cell_maxs, d_cell_mins, d_hubsScanned, d_pointsScanned, num_cells, frozen); break;
+                    case 4: QueryWithPoints<4><<<num_blocks, dim3{warp_size, (int)queries_per_block, 1}, 3 * H * sizeof(float), streams[i]>>>(i, k, d_query_cell_counts, d_bin_counts, d_query_points, d_query_cell_psum, d_query_cell_list, results_distances, results_knn, d_arr_idx_arr, d_sorted_idx, d_arr_x_arr, d_arr_y_arr, d_arr_z_arr, d_data_chunks, d_dH, d_dH_psum, d_cell_psum, d_D_arr, d_iD_arr, d_dD_arr, d_cell_maxs, d_cell_mins, d_hubsScanned, d_pointsScanned, num_cells, frozen); break;
+                    case 5: QueryWithPoints<5><<<num_blocks, dim3{warp_size, (int)queries_per_block, 1}, 3 * H * sizeof(float), streams[i]>>>(i, k, d_query_cell_counts, d_bin_counts, d_query_points, d_query_cell_psum, d_query_cell_list, results_distances, results_knn, d_arr_idx_arr, d_sorted_idx, d_arr_x_arr, d_arr_y_arr, d_arr_z_arr, d_data_chunks, d_dH, d_dH_psum, d_cell_psum, d_D_arr, d_iD_arr, d_dD_arr, d_cell_maxs, d_cell_mins, d_hubsScanned, d_pointsScanned, num_cells, frozen); break;
+                    case 6: QueryWithPoints<6><<<num_blocks, dim3{warp_size, (int)queries_per_block, 1}, 3 * H * sizeof(float), streams[i]>>>(i, k, d_query_cell_counts, d_bin_counts, d_query_points, d_query_cell_psum, d_query_cell_list, results_distances, results_knn, d_arr_idx_arr, d_sorted_idx, d_arr_x_arr, d_arr_y_arr, d_arr_z_arr, d_data_chunks, d_dH, d_dH_psum, d_cell_psum, d_D_arr, d_iD_arr, d_dD_arr, d_cell_maxs, d_cell_mins, d_hubsScanned, d_pointsScanned, num_cells, frozen); break;
+                    case 7: QueryWithPoints<7><<<num_blocks, dim3{warp_size, (int)queries_per_block, 1}, 3 * H * sizeof(float), streams[i]>>>(i, k, d_query_cell_counts, d_bin_counts, d_query_points, d_query_cell_psum, d_query_cell_list, results_distances, results_knn, d_arr_idx_arr, d_sorted_idx, d_arr_x_arr, d_arr_y_arr, d_arr_z_arr, d_data_chunks, d_dH, d_dH_psum, d_cell_psum, d_D_arr, d_iD_arr, d_dD_arr, d_cell_maxs, d_cell_mins, d_hubsScanned, d_pointsScanned, num_cells, frozen); break;
+                    case 8: QueryWithPoints<8><<<num_blocks, dim3{warp_size, (int)queries_per_block, 1}, 3 * H * sizeof(float), streams[i]>>>(i, k, d_query_cell_counts, d_bin_counts, d_query_points, d_query_cell_psum, d_query_cell_list, results_distances, results_knn, d_arr_idx_arr, d_sorted_idx, d_arr_x_arr, d_arr_y_arr, d_arr_z_arr, d_data_chunks, d_dH, d_dH_psum, d_cell_psum, d_D_arr, d_iD_arr, d_dD_arr, d_cell_maxs, d_cell_mins, d_hubsScanned, d_pointsScanned, num_cells, frozen); break;
                     default: assert(false && "Rounds required to fulfill k value will exceed thread register allotment.");
                 }
             }

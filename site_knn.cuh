@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 
 #include "bitonic-hubs-grid.cuh"
+#include "near_project.cuh"
 
 __global__ static void fill_iota(idx_t* out, int n){
     int i = blockIdx.x*blockDim.x + threadIdx.x;
@@ -15,6 +16,27 @@ __global__ static void fill_iota(idx_t* out, int n){
 
 static inline float elapsed_ms(cudaEvent_t a, cudaEvent_t b){
     float ms=0.f; cudaEventElapsedTime(&ms,a,b); return ms;
+}
+
+/** Site-site K-NN by bruteforce (mode 0). Writes K neighbors per point to d_knn (no self). */
+template<int K>
+static inline float run_knn_sites_bruteforce(int N, unsigned char* __restrict__ frozen,
+    const float3* d_pts, idx_t* d_knn)
+{
+    cudaEvent_t t0, t1;
+    cudaEventCreate(&t0);
+    cudaEventCreate(&t1);
+    cudaEventRecord(t0);
+    int block = 256;
+    int grid = (N + block - 1) / block;
+    knn_sites_bruteforce_kernel<K, idx_t><<<grid, block>>>(d_pts, N, frozen, d_knn);
+    cudaDeviceSynchronize();
+    cudaEventRecord(t1);
+    cudaEventSynchronize(t1);
+    float ms = elapsed_ms(t0, t1);
+    cudaEventDestroy(t0);
+    cudaEventDestroy(t1);
+    return ms;
 }
 
 static inline float run_knn_bitonic_hubs(int N, int K, unsigned char* __restrict__ frozen, const float3* d_pts, idx_t* d_knn, float* d_dist){
