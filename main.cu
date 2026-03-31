@@ -591,11 +591,11 @@ int main(int argc, char** argv)
         cudaMalloc(&d_streak_tier, 6 * sizeof(int));
         float h_thresh2[6];
         int h_streak[6];
-        // Density-scaled streaks + curvature-scaled Jaccard Gate 2
-        // Combined with periodic KNN refresh to bound stale-KNN error
+        // Density-adapted streaks: gentle scaling (exponent 0.15, floor 0.5)
         const double N_ref = 50000.0;
-        double scale = std::pow(N_ref / (double)nV, 0.3);
+        double scale = std::pow(N_ref / (double)nV, 0.15);
         if (scale > 1.0) scale = 1.0;
+        if (scale < 0.5) scale = 0.5;
         for (int t = 0; t < 6; ++t) {
             h_thresh2[t] = freeze_disp;
             int base = (t < 5) ? tier1::STREAK[t] : tier1::STREAK[4];
@@ -608,7 +608,7 @@ int main(int argc, char** argv)
         float h_jaccard[6] = {0.50f, 0.60f, 0.75f, 0.85f, 1.00f, 1.00f};
         cudaMalloc(&d_jaccard_per_tier, 6 * sizeof(float));
         cudaMemcpy(d_jaccard_per_tier, h_jaccard, 6 * sizeof(float), cudaMemcpyHostToDevice);
-        printf("density-scaled streak: scale=%.3f (nV=%d) streaks=[%d,%d,%d,%d,%d,%d]\n",
+        printf("density-adapted streaks: scale=%.3f (nV=%d) streaks=[%d,%d,%d,%d,%d,%d]\n",
                scale, nV, h_streak[0],h_streak[1],h_streak[2],h_streak[3],h_streak[4],h_streak[5]);
         printf("curvature-scaled Jaccard: [%.2f,%.2f,%.2f,%.2f,%.2f,%.2f]\n",
                h_jaccard[0],h_jaccard[1],h_jaccard[2],h_jaccard[3],h_jaccard[4],h_jaccard[5]);
@@ -640,9 +640,11 @@ int main(int argc, char** argv)
 
     float* dKnnV_dist = nullptr;
     int* dPrevKnnV = nullptr;
+    float* dSiteKnnDist = nullptr;  // saved site KNN distances for warm-starting centroid query
     if (mode != 0) {
         cudaMalloc(&dKnnV_dist, (size_t)nV * KPROJ * sizeof(float));
         cudaMalloc(&dPrevKnnV, (size_t)nV * KPROJ * sizeof(int));
+        cudaMalloc(&dSiteKnnDist, (size_t)nV * KPROJ * sizeof(float));
     }
 
     int* dFrozenSum = nullptr;
@@ -718,6 +720,15 @@ int main(int argc, char** argv)
             printf("freeze stability: all %d neighbors\n", K_NEIGH);
     }
 
+    // Build cached bitonic KNN data structure over mesh vertices (dV) — reused every iteration
+    BitonicKnnCache mesh_knn_cache;
+    KnnQueryScratch knn_scratch;
+    if (mode != 0) {
+        mesh_knn_cache = build_knn_mesh_cache(nV, dV);
+        knn_scratch = alloc_knn_query_scratch(nV);
+        printf("mesh KNN cache built (valid=%d)\n", (int)mesh_knn_cache.valid);
+    }
+
     // Running buffers for 10-iter average of kernel/iter times (written to CSV at dump iters)
     std::vector<float> buf_iter_remesh(DUMP_STRIDE, 0.f);
     std::vector<float> buf_knn_sites(DUMP_STRIDE, 0.f);
@@ -775,12 +786,12 @@ int main(int argc, char** argv)
             if (refresh_iter) {
                 // Query all sites on refresh
                 cudaMemset(dFrozen, 0, (size_t)nV);
-                knn_site_to_mesh_ms = run_knn_bitonic_query_to_mesh(nV, dV, dS, nV, KPROJ, dFrozen,
-                    (idx_t*)dKnnV, dKnnV_dist, "site_to_mesh");
+                knn_site_to_mesh_ms = run_knn_cached_query_to_mesh(mesh_knn_cache, dS, nV, KPROJ, dFrozen,
+                    (idx_t*)dKnnV, dKnnV_dist, knn_scratch);
                 cudaMemcpy(dFrozen, dFrozenBackup, (size_t)nV, cudaMemcpyDeviceToDevice);
             } else {
-                knn_site_to_mesh_ms = run_knn_bitonic_query_to_mesh(nV, dV, dS, nV, KPROJ, dFrozen,
-                    (idx_t*)dKnnV, dKnnV_dist, "site_to_mesh");
+                knn_site_to_mesh_ms = run_knn_cached_query_to_mesh(mesh_knn_cache, dS, nV, KPROJ, dFrozen,
+                    (idx_t*)dKnnV, dKnnV_dist, knn_scratch);
                 restore_prev_knn_vertices_kernel<KPROJ><<<grd, blk>>>(dFrozen, dPrevKnnV, dKnnV, nV);
             }
             cudaDeviceSynchronize();
@@ -814,15 +825,19 @@ int main(int argc, char** argv)
         printf("centroids_ms %.3f\n", centroids_ms);
 
         if (mode != 0) {
+            // Save site KNN result as seed for centroid warm-start
             cudaMemcpy(dPrevKnnV, dKnnV, (size_t)nV * KPROJ * sizeof(int), cudaMemcpyDeviceToDevice);
+            cudaMemcpy(dSiteKnnDist, dKnnV_dist, (size_t)nV * KPROJ * sizeof(float), cudaMemcpyDeviceToDevice);
             if (refresh_iter) {
                 cudaMemset(dFrozen, 0, (size_t)nV);
-                knn_centroid_to_mesh_ms = run_knn_bitonic_query_to_mesh(nV, dV, dCent, nV, KPROJ, dFrozen,
-                    (idx_t*)dKnnV, dKnnV_dist, "centroid_to_mesh");
+                knn_centroid_to_mesh_ms = run_knn_cached_query_to_mesh(mesh_knn_cache, dCent, nV, KPROJ, dFrozen,
+                    (idx_t*)dKnnV, dKnnV_dist, knn_scratch,
+                    (const idx_t*)dPrevKnnV, dSiteKnnDist);
                 cudaMemcpy(dFrozen, dFrozenBackup, (size_t)nV, cudaMemcpyDeviceToDevice);
             } else {
-                knn_centroid_to_mesh_ms = run_knn_bitonic_query_to_mesh(nV, dV, dCent, nV, KPROJ, dFrozen,
-                    (idx_t*)dKnnV, dKnnV_dist, "centroid_to_mesh");
+                knn_centroid_to_mesh_ms = run_knn_cached_query_to_mesh(mesh_knn_cache, dCent, nV, KPROJ, dFrozen,
+                    (idx_t*)dKnnV, dKnnV_dist, knn_scratch,
+                    (const idx_t*)dPrevKnnV, dSiteKnnDist);
                 restore_prev_knn_vertices_kernel<KPROJ><<<grd, blk>>>(dFrozen, dPrevKnnV, dKnnV, nV);
             }
             cudaDeviceSynchronize();
@@ -1038,7 +1053,7 @@ int main(int argc, char** argv)
 
         if (mode != 0) {
             cudaMemcpy(dPrevKnnV, dKnnV, (size_t)nV * KPROJ * sizeof(int), cudaMemcpyDeviceToDevice);
-            run_knn_bitonic_query_to_mesh(nV, dV, dS, nV, KPROJ, dFrozen, (idx_t*)dKnnV, dKnnV_dist, "site_to_mesh");
+            run_knn_cached_query_to_mesh(mesh_knn_cache, dS, nV, KPROJ, dFrozen, (idx_t*)dKnnV, dKnnV_dist, knn_scratch);
             restore_prev_knn_vertices_kernel<KPROJ><<<grd, blk>>>(dFrozen, dPrevKnnV, dKnnV, nV);
         } else {
             knn_vertices_bruteforce_k<KPROJ, false><<<grd, blk>>>(dV, nV, dS, nV, dFrozen, dKnnV);
@@ -1265,6 +1280,11 @@ int main(int argc, char** argv)
 
     cudaEventDestroy(e0);
     cudaEventDestroy(e1);
+
+    if (mesh_knn_cache.valid) {
+        destroy_knn_mesh_cache(mesh_knn_cache);
+        free_knn_query_scratch(knn_scratch);
+    }
 
     cudaFree(dCounts);
     cudaFree(dFrozen);

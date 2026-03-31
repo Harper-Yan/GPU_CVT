@@ -1070,7 +1070,9 @@ void QueryWithPoints( int stream_id, int K, int* __restrict__ query_cell_counts,
     int* __restrict__ hubs_scanned,
     int* __restrict__ pointsScanned,
     int num_cells,
-    const unsigned char* __restrict__ frozen
+    const unsigned char* __restrict__ frozen,
+    const idx_t* __restrict__ seed_knn = nullptr,
+    const float* __restrict__ seed_dist = nullptr
 )
 {
     extern __shared__ float smem_hub[];
@@ -1102,11 +1104,6 @@ void QueryWithPoints( int stream_id, int K, int* __restrict__ query_cell_counts,
     idx_t best_point_id[ROUNDS];
     float best_distance[ROUNDS];
 
-    for (int i = 0; i < ROUNDS; i++) {
-        best_point_id[i] = -1;
-        best_distance[i] = FLT_MAX;
-    }
-
     idx_t const lane_K  = (K - 1) % warp_size;
     idx_t const round_K = ROUNDS - 1;
     int cell = stream_id;
@@ -1116,29 +1113,52 @@ void QueryWithPoints( int stream_id, int K, int* __restrict__ query_cell_counts,
     int hub_containing_qp = get_assignment_smem(q_xyz, shared_hx, shared_hy, shared_hz);
     idx_t* global_idx_current_cell = sorted_global_idx + cell_psum[cell];
 
-    query_own_cell<ROUNDS>(
-        cell,
-        0,
-        hub_containing_qp,
-        K,
-        arr_idx_arr,
-        arr_x_arr,
-        arr_y_arr,
-        arr_z_arr,
-        q_xyz,
-        data,
-        dH,
-        global_idx_current_cell,
-        dH_psum,
-        best_point_id,
-        best_distance,
-        dD_arr,
-        iD_arr,
-        H,
-        cell_bin_counts[cell],
-        hubs_scanned + global_query_id,
-        pointsScanned + global_query_id
-    );
+    if (seed_knn && seed_dist) {
+        // Warm-start: load K nearest from seed (e.g. site KNN result)
+        // seed is indexed by global_query_id * K + lane
+        for (int r = 0; r < ROUNDS; r++) {
+            int global_lane = r * warp_size + lane_id;
+            if (global_lane < K) {
+                int loc = global_query_id * K + global_lane;
+                best_point_id[r] = seed_knn[loc];
+                best_distance[r] = seed_dist[loc];
+            } else {
+                best_point_id[r] = (idx_t)-1;
+                best_distance[r] = FLT_MAX;
+            }
+        }
+        // Seed may not be sorted — sort to establish correct kth_distance
+        bitonic::sort<true, ROUNDS>(best_point_id, best_distance);
+    } else {
+        for (int i = 0; i < ROUNDS; i++) {
+            best_point_id[i] = -1;
+            best_distance[i] = FLT_MAX;
+        }
+
+        query_own_cell<ROUNDS>(
+            cell,
+            0,
+            hub_containing_qp,
+            K,
+            arr_idx_arr,
+            arr_x_arr,
+            arr_y_arr,
+            arr_z_arr,
+            q_xyz,
+            data,
+            dH,
+            global_idx_current_cell,
+            dH_psum,
+            best_point_id,
+            best_distance,
+            dD_arr,
+            iD_arr,
+            H,
+            cell_bin_counts[cell],
+            hubs_scanned + global_query_id,
+            pointsScanned + global_query_id
+        );
+    }
 
     for (int i = 0; i < num_cells; i++) {
         if (i != stream_id) {
@@ -1193,6 +1213,293 @@ void QueryWithPoints( int stream_id, int K, int* __restrict__ query_cell_counts,
  * - Q array: pass query_points != nullptr (q * 3 floats). Query points need not be in the dataset.
  * - Q index: pass query_points == nullptr and queries (q indices into data). Omit or pass q==0 to use all n points as queries.
  */
+// ─── Cached data structure for repeated KNN queries over the same candidates ───
+struct BitonicKnnCache {
+    bool valid = false;
+    std::size_t n = 0;          // number of candidate points
+
+    // Host values needed for query-point binning
+    float min_vals[3], max_vals[3];
+    int h_bin_counts_0;         // with p=1, single cell
+    int h_cell_psum_0;          // always 0
+
+    // Grid (device)
+    float* d_data       = nullptr;   // sorted candidate coords (3*n)
+    idx_t* d_sorted_idx = nullptr;   // sorted indices (n)
+    int*   d_bin_counts = nullptr;   // (1)
+    int*   d_cell_psum  = nullptr;   // (1)
+    float* d_cell_mins  = nullptr;   // (3)
+    float* d_cell_maxs  = nullptr;   // (3)
+
+    // Clover (single stream, p=1)
+    idx_t* dH              = nullptr;  // (H)
+    idx_t* dH_psum         = nullptr;  // (H+1)
+    idx_t* dH_assignments  = nullptr;  // (n)
+    float* arr_x = nullptr, *arr_y = nullptr, *arr_z = nullptr; // (n each)
+    idx_t* arr_idx         = nullptr;  // (n)
+    idx_t* iD              = nullptr;  // (H*H)
+    float* dD              = nullptr;  // (H*H)
+    float* chunk_ptr       = nullptr;  // = d_data (alias, do not free)
+
+    // Device pointer arrays (1-element arrays for single stream)
+    idx_t** d_dH              = nullptr;
+    idx_t** d_dH_psum         = nullptr;
+    idx_t** d_dH_assignments  = nullptr;
+    float** d_arr_x_arr      = nullptr;
+    float** d_arr_y_arr      = nullptr;
+    float** d_arr_z_arr      = nullptr;
+    idx_t** d_arr_idx_arr    = nullptr;
+    float** d_data_chunks    = nullptr;
+    float** d_D_arr          = nullptr;   // points to nullptr (D freed after sort)
+    idx_t** d_iD_arr         = nullptr;
+    float** d_dD_arr         = nullptr;
+
+    cudaStream_t stream = 0;
+
+    // Pre-allocated per-query buffers (avoid repeated cudaMalloc/cudaFree)
+    std::size_t q_alloc = 0;   // size these were allocated for
+    float*  d_query_points    = nullptr;
+    int*    d_query_cell_psum = nullptr;
+    idx_t*  d_query_cell_list = nullptr;  // also used as active_list
+    int*    d_query_cell_counts = nullptr;
+    int*    d_hubsScanned     = nullptr;
+    int*    d_pointsScanned   = nullptr;
+    int*    d_n_active        = nullptr;
+};
+
+template <class R>
+BitonicKnnCache C_build(std::size_t n, R* data)
+{
+    BitonicKnnCache c;
+    c.n = n;
+    int constexpr block_size = 1024;
+    int constexpr p = 1;
+    c.h_cell_psum_0 = 0;
+
+    // ── Grid preprocessing ──
+    int dim = 3;
+    int* d_min_vals_int; int* d_max_vals_int;
+    cudaMalloc(&d_min_vals_int, sizeof(int) * dim);
+    cudaMalloc(&d_max_vals_int, sizeof(int) * dim);
+    int h_init_min[3] = { float_to_ordered_int(FLT_MAX), float_to_ordered_int(FLT_MAX), float_to_ordered_int(FLT_MAX) };
+    int h_init_max[3] = { float_to_ordered_int(-FLT_MAX), float_to_ordered_int(-FLT_MAX), float_to_ordered_int(-FLT_MAX) };
+    cudaMemcpy(d_min_vals_int, h_init_min, sizeof(int)*dim, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_max_vals_int, h_init_max, sizeof(int)*dim, cudaMemcpyHostToDevice);
+    compute_min_max<<<(n+block_size-1)/block_size, block_size>>>(data, d_min_vals_int, d_max_vals_int, n);
+    { cudaError_t e = cudaDeviceSynchronize(); if (e != cudaSuccess) printf("C_build: compute_min_max failed: %s\n", cudaGetErrorString(e)); }
+    cudaMemcpy(h_init_min, d_min_vals_int, sizeof(int)*dim, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_init_max, d_max_vals_int, sizeof(int)*dim, cudaMemcpyDeviceToHost);
+    cudaFree(d_min_vals_int); cudaFree(d_max_vals_int);
+
+    for (int i = 0; i < dim; ++i) {
+        c.min_vals[i] = ordered_int_to_float(h_init_min[i]);
+        c.max_vals[i] = ordered_int_to_float(h_init_max[i]);
+    }
+
+    float* d_min_vals; float* d_max_vals;
+    cudaMalloc(&d_min_vals, sizeof(float)*dim);
+    cudaMalloc(&d_max_vals, sizeof(float)*dim);
+    cudaMemcpy(d_min_vals, c.min_vals, sizeof(float)*dim, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_max_vals, c.max_vals, sizeof(float)*dim, cudaMemcpyHostToDevice);
+
+    int* d_bin_ids;
+    cudaMalloc(&d_bin_ids, sizeof(int)*n);
+    cudaMalloc(&c.d_bin_counts, sizeof(int)*1);
+    cudaMemset(c.d_bin_counts, 0, sizeof(int)*1);
+    assign_bins<<<(n+block_size-1)/block_size, block_size>>>(data, d_min_vals, d_max_vals, d_bin_ids, c.d_bin_counts, n, p);
+
+    cudaMalloc(&c.d_cell_psum, sizeof(int)*1);
+    cudaMemset(c.d_cell_psum, 0, sizeof(int)*1);
+    cudaMemcpy(&c.h_bin_counts_0, c.d_bin_counts, sizeof(int), cudaMemcpyDeviceToHost);
+
+    cudaMalloc(&c.d_data, sizeof(float)*dim*n);
+    cudaMalloc(&c.d_sorted_idx, sizeof(idx_t)*n);
+    int* d_cell_psum_copy;
+    cudaMalloc(&d_cell_psum_copy, sizeof(int)*1);
+    cudaMemcpy(d_cell_psum_copy, c.d_cell_psum, sizeof(int)*1, cudaMemcpyDeviceToDevice);
+    BucketSortPoints<<<(n+block_size-1)/block_size, block_size>>>(n, data, c.d_data, d_bin_ids, d_cell_psum_copy, c.d_sorted_idx);
+    cudaFree(d_cell_psum_copy);
+    cudaFree(d_bin_ids);
+    cudaFree(d_min_vals); cudaFree(d_max_vals);
+
+    std::vector<float> cell_mins_v, cell_maxs_v;
+    compute_cell_bounds(c.min_vals, c.max_vals, p, dim, cell_mins_v, cell_maxs_v);
+    size_t bounds_size = cell_mins_v.size() * sizeof(float);
+    cudaMalloc(&c.d_cell_mins, bounds_size);
+    cudaMalloc(&c.d_cell_maxs, bounds_size);
+    cudaMemcpy(c.d_cell_mins, cell_mins_v.data(), bounds_size, cudaMemcpyHostToDevice);
+    cudaMemcpy(c.d_cell_maxs, cell_maxs_v.data(), bounds_size, cudaMemcpyHostToDevice);
+
+    // ── Stream + clover construction ──
+    cudaStreamCreate(&c.stream);
+    c.chunk_ptr = c.d_data; // with p=1, offset is 0
+
+    std::size_t n_stream = c.h_bin_counts_0;
+
+    cudaMalloc(&c.dH,             sizeof(idx_t)*H);
+    cudaMalloc(&c.dH_psum,        sizeof(idx_t)*(H+1));
+    idx_t* dH_psum_copy_s;
+    cudaMalloc(&dH_psum_copy_s,   sizeof(idx_t)*(H+1));
+    idx_t* d_psum_placeholder;
+    cudaMalloc(&d_psum_placeholder, sizeof(idx_t)*(H+1));
+    cudaMalloc(&c.dH_assignments,  sizeof(idx_t)*n_stream);
+
+    cudaMemsetAsync(c.dH_psum,        0, sizeof(idx_t)*(H+1), c.stream);
+    cudaMemsetAsync(dH_psum_copy_s,   0, sizeof(idx_t)*(H+1), c.stream);
+    cudaMemsetAsync(d_psum_placeholder,0, sizeof(idx_t)*(H+1), c.stream);
+    cudaMemsetAsync(c.dH_assignments,  0, sizeof(idx_t)*n_stream, c.stream);
+
+    float* distances_arr;
+    idx_t batch_size = 1024 * 4;
+    cudaMalloc(&distances_arr, sizeof(float)*H*batch_size);
+    cudaMalloc(&c.arr_x,   sizeof(float)*n_stream);
+    cudaMalloc(&c.arr_y,   sizeof(float)*n_stream);
+    cudaMalloc(&c.arr_z,   sizeof(float)*n_stream);
+    cudaMalloc(&c.arr_idx, sizeof(idx_t)*n_stream);
+
+    float* D_arr;
+    cudaMalloc(&D_arr,  sizeof(float)*H*H);
+    cudaMalloc(&c.iD,   sizeof(idx_t)*H*H);
+    cudaMalloc(&c.dD,   sizeof(float)*H*H);
+
+    // Hub selection
+    bool ok = GenerateUniqueHubsAndUpload(n_stream, H, c.dH, c.stream, 0);
+    if (!ok) { c.valid = false; return c; }
+
+    // Calculate distances + construct D
+    set_max_float<<<(H*H+block_size-1)/block_size, block_size>>>(D_arr, H*H);
+    int tem_block_size = 128;
+    idx_t batch_number = (n_stream + batch_size - 1) / batch_size;
+    for (idx_t batch_id = 0; batch_id < batch_number; batch_id++) {
+        Calculate_Distances<<<(batch_size+tem_block_size-1)/tem_block_size, tem_block_size,
+            3*H*sizeof(float), c.stream>>>(batch_id, batch_size, n_stream, c.dH, distances_arr, c.chunk_ptr, c.dH_psum, c.dH_assignments);
+        Construct_D<<<H, block_size, sizeof(int)*H, c.stream>>>(distances_arr, c.dH_assignments, batch_id, batch_size, n_stream, D_arr);
+    }
+    cudaFree(distances_arr);
+
+    // Prefix sum
+    fused_prefix_sum_copy<<<1, dim3(warp_size, warp_size, 1), sizeof(int)*(warp_size+1), c.stream>>>(c.dH_psum, dH_psum_copy_s);
+    cudaMemcpy(d_psum_placeholder, dH_psum_copy_s, (H+1)*sizeof(idx_t), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(dH_psum_copy_s + 1, d_psum_placeholder, H*sizeof(idx_t), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(c.dH_psum + 1,      d_psum_placeholder, H*sizeof(idx_t), cudaMemcpyDeviceToDevice);
+    cudaMemset(c.dH_psum, 0, sizeof(idx_t));
+    cudaMemset(dH_psum_copy_s, 0, sizeof(idx_t));
+    cudaFree(d_psum_placeholder);
+
+    // Bucket sort
+    BucketSort<float><<<(n_stream+block_size-1)/block_size, block_size, 0, c.stream>>>(
+        n_stream, c.arr_x, c.arr_y, c.arr_z, c.arr_idx, c.chunk_ptr, c.dH_assignments, dH_psum_copy_s);
+    cudaStreamSynchronize(c.stream);
+    cudaFree(dH_psum_copy_s);
+
+    // Sort D
+    fused_transform_sort_D<float, (H+block_size-1)/block_size><<<H, dim3{warp_size, block_size/warp_size, 1}, 2*H*sizeof(float), c.stream>>>(D_arr, c.iD, c.dD);
+    cudaStreamSynchronize(c.stream);
+    cudaFree(D_arr);
+
+    // ── Device pointer arrays (1-element each) ──
+    cudaMalloc(&c.d_dH,             sizeof(idx_t*));
+    cudaMalloc(&c.d_dH_psum,        sizeof(idx_t*));
+    cudaMalloc(&c.d_dH_assignments, sizeof(idx_t*));
+    cudaMalloc(&c.d_arr_x_arr,      sizeof(float*));
+    cudaMalloc(&c.d_arr_y_arr,      sizeof(float*));
+    cudaMalloc(&c.d_arr_z_arr,      sizeof(float*));
+    cudaMalloc(&c.d_arr_idx_arr,    sizeof(idx_t*));
+    cudaMalloc(&c.d_data_chunks,    sizeof(float*));
+    cudaMalloc(&c.d_D_arr,          sizeof(float*));
+    cudaMalloc(&c.d_iD_arr,         sizeof(idx_t*));
+    cudaMalloc(&c.d_dD_arr,         sizeof(float*));
+
+    cudaMemcpy(c.d_dH,             &c.dH,             sizeof(idx_t*), cudaMemcpyHostToDevice);
+    cudaMemcpy(c.d_dH_psum,        &c.dH_psum,        sizeof(idx_t*), cudaMemcpyHostToDevice);
+    cudaMemcpy(c.d_dH_assignments, &c.dH_assignments,  sizeof(idx_t*), cudaMemcpyHostToDevice);
+    cudaMemcpy(c.d_arr_x_arr,      &c.arr_x,          sizeof(float*), cudaMemcpyHostToDevice);
+    cudaMemcpy(c.d_arr_y_arr,      &c.arr_y,          sizeof(float*), cudaMemcpyHostToDevice);
+    cudaMemcpy(c.d_arr_z_arr,      &c.arr_z,          sizeof(float*), cudaMemcpyHostToDevice);
+    cudaMemcpy(c.d_arr_idx_arr,    &c.arr_idx,        sizeof(idx_t*), cudaMemcpyHostToDevice);
+    cudaMemcpy(c.d_data_chunks,    &c.chunk_ptr,      sizeof(float*), cudaMemcpyHostToDevice);
+    float* null_ptr = nullptr;
+    cudaMemcpy(c.d_D_arr,          &null_ptr,         sizeof(float*), cudaMemcpyHostToDevice);
+    cudaMemcpy(c.d_iD_arr,         &c.iD,             sizeof(idx_t*), cudaMemcpyHostToDevice);
+    cudaMemcpy(c.d_dD_arr,         &c.dD,             sizeof(float*), cudaMemcpyHostToDevice);
+
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        printf("C_build error: %s\n", cudaGetErrorString(err));
+        c.valid = false;
+        return c;
+    }
+    // Clear any sticky error
+    cudaGetLastError();
+    c.valid = true;
+    return c;
+}
+
+template <class R>
+void C_query(const BitonicKnnCache& c, std::size_t q, std::size_t k,
+             idx_t* results_knn, R* results_distances,
+             R* scratch_qp, idx_t* scratch_idx,
+             int* scratch_misc, int* scratch_hubs, int* scratch_pts,
+             const idx_t* seed_knn = nullptr, const R* seed_dist = nullptr)
+{
+    int constexpr num_cells = 1;
+
+    // Caller has set up all scratch buffers (memcpy'd cell_psum, cell_counts, memset hubs/pts).
+    // Just launch the kernel.
+    int h_n_active = (int)q;
+    if (h_n_active == 0) return;
+
+    R*   d_query_points      = scratch_qp;
+    idx_t* d_active_list     = scratch_idx;
+    int* d_query_cell_psum   = scratch_misc;
+    int* d_query_cell_counts = scratch_misc + 2;
+    int* d_hubsScanned       = scratch_hubs;
+    int* d_pointsScanned     = scratch_pts;
+    unsigned char* no_frozen = nullptr;
+    std::size_t constexpr queries_per_block = 32 / warp_size;
+    {
+        int i = 0;  // single cell
+        int n_stream = h_n_active;
+        int num_blocks = util::CEIL_DIV(n_stream, (int)queries_per_block);
+        switch (util::CEIL_DIV(k, (std::size_t)warp_size)) {
+            case 1: QueryWithPoints<1><<<num_blocks, dim3{warp_size, (int)queries_per_block, 1}, 3*H*sizeof(float), c.stream>>>(i, k, d_query_cell_counts, c.d_bin_counts, d_query_points, d_query_cell_psum, d_active_list, results_distances, results_knn, c.d_arr_idx_arr, c.d_sorted_idx, c.d_arr_x_arr, c.d_arr_y_arr, c.d_arr_z_arr, c.d_data_chunks, c.d_dH, c.d_dH_psum, c.d_cell_psum, c.d_D_arr, c.d_iD_arr, c.d_dD_arr, c.d_cell_maxs, c.d_cell_mins, d_hubsScanned, d_pointsScanned, num_cells, no_frozen, seed_knn, seed_dist); break;
+            case 2: QueryWithPoints<2><<<num_blocks, dim3{warp_size, (int)queries_per_block, 1}, 3*H*sizeof(float), c.stream>>>(i, k, d_query_cell_counts, c.d_bin_counts, d_query_points, d_query_cell_psum, d_active_list, results_distances, results_knn, c.d_arr_idx_arr, c.d_sorted_idx, c.d_arr_x_arr, c.d_arr_y_arr, c.d_arr_z_arr, c.d_data_chunks, c.d_dH, c.d_dH_psum, c.d_cell_psum, c.d_D_arr, c.d_iD_arr, c.d_dD_arr, c.d_cell_maxs, c.d_cell_mins, d_hubsScanned, d_pointsScanned, num_cells, no_frozen, seed_knn, seed_dist); break;
+            case 3: QueryWithPoints<3><<<num_blocks, dim3{warp_size, (int)queries_per_block, 1}, 3*H*sizeof(float), c.stream>>>(i, k, d_query_cell_counts, c.d_bin_counts, d_query_points, d_query_cell_psum, d_active_list, results_distances, results_knn, c.d_arr_idx_arr, c.d_sorted_idx, c.d_arr_x_arr, c.d_arr_y_arr, c.d_arr_z_arr, c.d_data_chunks, c.d_dH, c.d_dH_psum, c.d_cell_psum, c.d_D_arr, c.d_iD_arr, c.d_dD_arr, c.d_cell_maxs, c.d_cell_mins, d_hubsScanned, d_pointsScanned, num_cells, no_frozen, seed_knn, seed_dist); break;
+            case 4: QueryWithPoints<4><<<num_blocks, dim3{warp_size, (int)queries_per_block, 1}, 3*H*sizeof(float), c.stream>>>(i, k, d_query_cell_counts, c.d_bin_counts, d_query_points, d_query_cell_psum, d_active_list, results_distances, results_knn, c.d_arr_idx_arr, c.d_sorted_idx, c.d_arr_x_arr, c.d_arr_y_arr, c.d_arr_z_arr, c.d_data_chunks, c.d_dH, c.d_dH_psum, c.d_cell_psum, c.d_D_arr, c.d_iD_arr, c.d_dD_arr, c.d_cell_maxs, c.d_cell_mins, d_hubsScanned, d_pointsScanned, num_cells, no_frozen, seed_knn, seed_dist); break;
+            case 5: QueryWithPoints<5><<<num_blocks, dim3{warp_size, (int)queries_per_block, 1}, 3*H*sizeof(float), c.stream>>>(i, k, d_query_cell_counts, c.d_bin_counts, d_query_points, d_query_cell_psum, d_active_list, results_distances, results_knn, c.d_arr_idx_arr, c.d_sorted_idx, c.d_arr_x_arr, c.d_arr_y_arr, c.d_arr_z_arr, c.d_data_chunks, c.d_dH, c.d_dH_psum, c.d_cell_psum, c.d_D_arr, c.d_iD_arr, c.d_dD_arr, c.d_cell_maxs, c.d_cell_mins, d_hubsScanned, d_pointsScanned, num_cells, no_frozen, seed_knn, seed_dist); break;
+            case 6: QueryWithPoints<6><<<num_blocks, dim3{warp_size, (int)queries_per_block, 1}, 3*H*sizeof(float), c.stream>>>(i, k, d_query_cell_counts, c.d_bin_counts, d_query_points, d_query_cell_psum, d_active_list, results_distances, results_knn, c.d_arr_idx_arr, c.d_sorted_idx, c.d_arr_x_arr, c.d_arr_y_arr, c.d_arr_z_arr, c.d_data_chunks, c.d_dH, c.d_dH_psum, c.d_cell_psum, c.d_D_arr, c.d_iD_arr, c.d_dD_arr, c.d_cell_maxs, c.d_cell_mins, d_hubsScanned, d_pointsScanned, num_cells, no_frozen, seed_knn, seed_dist); break;
+            case 7: QueryWithPoints<7><<<num_blocks, dim3{warp_size, (int)queries_per_block, 1}, 3*H*sizeof(float), c.stream>>>(i, k, d_query_cell_counts, c.d_bin_counts, d_query_points, d_query_cell_psum, d_active_list, results_distances, results_knn, c.d_arr_idx_arr, c.d_sorted_idx, c.d_arr_x_arr, c.d_arr_y_arr, c.d_arr_z_arr, c.d_data_chunks, c.d_dH, c.d_dH_psum, c.d_cell_psum, c.d_D_arr, c.d_iD_arr, c.d_dD_arr, c.d_cell_maxs, c.d_cell_mins, d_hubsScanned, d_pointsScanned, num_cells, no_frozen, seed_knn, seed_dist); break;
+            case 8: QueryWithPoints<8><<<num_blocks, dim3{warp_size, (int)queries_per_block, 1}, 3*H*sizeof(float), c.stream>>>(i, k, d_query_cell_counts, c.d_bin_counts, d_query_points, d_query_cell_psum, d_active_list, results_distances, results_knn, c.d_arr_idx_arr, c.d_sorted_idx, c.d_arr_x_arr, c.d_arr_y_arr, c.d_arr_z_arr, c.d_data_chunks, c.d_dH, c.d_dH_psum, c.d_cell_psum, c.d_D_arr, c.d_iD_arr, c.d_dD_arr, c.d_cell_maxs, c.d_cell_mins, d_hubsScanned, d_pointsScanned, num_cells, no_frozen, seed_knn, seed_dist); break;
+            default: assert(false && "k too large for cached query");
+        }
+    }
+    cudaDeviceSynchronize();
+
+    // Scratch buffers owned by caller — no free needed.
+}
+
+inline void C_destroy(BitonicKnnCache& c)
+{
+    if (!c.valid) return;
+    cudaFree(c.d_data);       cudaFree(c.d_sorted_idx);
+    cudaFree(c.d_bin_counts); cudaFree(c.d_cell_psum);
+    cudaFree(c.d_cell_mins);  cudaFree(c.d_cell_maxs);
+    cudaFree(c.dH);           cudaFree(c.dH_psum);
+    cudaFree(c.dH_assignments);
+    cudaFree(c.arr_x);  cudaFree(c.arr_y);  cudaFree(c.arr_z);
+    cudaFree(c.arr_idx);
+    cudaFree(c.iD);     cudaFree(c.dD);
+    cudaFree(c.d_dH);            cudaFree(c.d_dH_psum);
+    cudaFree(c.d_dH_assignments);
+    cudaFree(c.d_arr_x_arr);     cudaFree(c.d_arr_y_arr);
+    cudaFree(c.d_arr_z_arr);     cudaFree(c.d_arr_idx_arr);
+    cudaFree(c.d_data_chunks);
+    cudaFree(c.d_D_arr);  cudaFree(c.d_iD_arr);  cudaFree(c.d_dD_arr);
+    if (c.stream) cudaStreamDestroy(c.stream);
+    c.valid = false;
+}
+
+// ─── Original C_and_Q (used by site-to-site KNN which rebuilds each iteration) ───
 template <class R>
 void C_and_Q(std::size_t n, R *data, std::size_t q, idx_t *queries, std::size_t k, unsigned char* __restrict__ frozen, idx_t *results_knn, R *results_distances, std::string& mesh_name, R* query_points = nullptr)
 {
