@@ -383,10 +383,10 @@ int main(int argc, char** argv)
     if (argc >= 3) mode = std::atoi(argv[2]);
 
     // modes:
-    // 0: baseline (brute-force KNN, no freeze)
-    // 1: bitonic_only (bitonic KNN, no freeze — ablation)
-    // 2: freezing_cvt (bitonic KNN + 5-tier freeze)
-    const char* mode_name = (mode == 0) ? "baseline" : (mode == 1 ? "bitonic_only" : "freezing_cvt");
+    // 0: RTF (brute-force KNN, no freeze — tangent-plane Lloyd baseline)
+    // 1: reusable_bitonic (bitonic KNN, no freeze — ablation)
+    // 2: freeze (bitonic KNN + 5-tier freeze)
+    const char* mode_name = (mode == 0) ? "RTF" : (mode == 1 ? "reusable_bitonic" : "freeze");
     printf("mode %d (%s)\n", mode, mode_name);
 
     // ---------------- Tunable constants ----------------
@@ -566,7 +566,7 @@ int main(int argc, char** argv)
     int* d_streak_tier = nullptr;
     float* d_jaccard_per_tier = nullptr;
     if (mode == 1) {
-        // Mode 1 (bitonic_only): uses bitonic KNN path but no freezing.
+        // Mode 1 (reusable_bitonic): uses bitonic KNN path but no freezing.
         // Allocate tier arrays to keep code paths happy, but they won't trigger freezing
         // because dFrozen is cleared every iteration (see below).
         cudaMalloc(&d_tier_id, (size_t)nV);
@@ -673,7 +673,7 @@ int main(int argc, char** argv)
 
     float total_remesh_ms = 0.0f;
 
-    const char* root_dir = (mode == 0) ? "gpucvt" : (mode == 1 ? "bitonic_only" : "freeze");
+    const char* root_dir = (mode == 0) ? "RTF" : (mode == 1 ? "reusable_bitonic" : "freeze");
     const std::string output_base = "experiments/output";
     std::string out_dir = output_base + "/" + root_dir + "/" + mesh_name;
     std::filesystem::create_directories(out_dir);
@@ -1002,7 +1002,7 @@ int main(int argc, char** argv)
         }
 
         // Modes 0 and 1 compute dFrozen but clear it every iteration to avoid freezing.
-        // Mode 0 = brute-force KNN, no freeze; Mode 1 = bitonic KNN, no freeze.
+        // Mode 0 = RTF (brute-force KNN, no freeze); Mode 1 = reusable_bitonic (bitonic KNN, no freeze).
         if (mode == 0 || mode == 1) {
             cudaMemset(dFrozen, 0, (size_t)nV);
             cudaMemset(dFreezeStreak, 0, (size_t)nV);
@@ -1274,7 +1274,7 @@ int main(int argc, char** argv)
     printf("\nTotal remeshing time (mesh rebuilding excluded): %.3f ms\n", total_remesh_ms);
 
     {
-        const char* mode_str = (mode == 0) ? "gpucvt" : (mode == 1 ? "bitonic_only" : "freeze");
+        const char* mode_str = (mode == 0) ? "RTF" : (mode == 1 ? "reusable_bitonic" : "freeze");
         append_run_csv("experiments/runs.csv", mesh_name, mode_str, nV, final_nf, final_converge_rate, used_iters, total_remesh_ms);
     }
 
