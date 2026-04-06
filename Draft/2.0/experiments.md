@@ -5,14 +5,14 @@
 | Section | Main point | Data source |
 |---------|-----------|-------------|
 | 4.1 Setup | Hardware, 11 meshes (35K–2.8M), 3 modes, Geogram 250L baseline, quality metrics | objs/, baselines/ |
-| 4.2 Ablation: KNN reuse + freeze | Mode 1 gives 5–8× over Mode 0; Mode 2 adds 1.6–4.2× on top — synergistic, advantage grows with scale | eval CSVs, three_modes_quality.png |
+| 4.2 Ablation: KNN reuse + freeze | Mode 1 gives 5–8× over RTF; Mode 2 adds 1.6–4.2× on top — synergistic, advantage grows with scale | eval CSVs, three_modes_quality.png |
 | 4.3 Freeze behavior & quality | Freeze rate rises to 50–80% (medium) and 97%+ (large); quality tracks unfrozen baseline within negligible margin | three_modes_quality.png |
 | 4.4 vs. Geogram (CPU baseline) | Mode 2 is 3–10× faster than Geogram 250L at all tested scales (35K–544K) while matching quality | baseline_comparison.png |
 | 4.5 Scalability | M1→M2 speedup grows from 1.7× at 35K to 4.2× at 2.8M; at million-vertex scale, freeze reduces 16.7 min to 4.0 min | eval CSVs |
 
 ## Timing Data
 
-| Mesh | Vertices | Mode 0 (ms) | Mode 1 (ms) | Mode 2 (ms) | M0→M1 | M1→M2 | Geogram 250L (ms) | vs Geogram (M2) |
+| Mesh | Vertices | RTF (ms) | Mode 1 (ms) | Mode 2 (ms) | RTF→M1 | M1→M2 | Geogram 250L (ms) | vs Geogram (M2) |
 |------|----------|-------------|-------------|-------------|-------|-------|-------------------|-----------------|
 | stanford-bunny | 34,834 | 12,292 | 2,255 | 1,348 | 5.5× | 1.7× | 10,737 | 8.0× |
 | horse | 48,485 | 25,403 | 3,212 | 1,748 | 7.9× | 1.8× | 18,209 | 10.4× |
@@ -32,27 +32,27 @@
 
 We evaluate our method on 11 triangle meshes spanning three orders of magnitude in vertex count: three small meshes (34K–50K vertices), five medium meshes (112K–544K), and three large meshes (1.2M–2.8M). The meshes are selected to cover a range of geometric complexity, from smooth surfaces (Stanford Bunny) through moderate detail (Igea, Bimba) to fine features and large flat regions (Dragon, Happy Buddha, Lucy, Samothrace).
 
-All experiments run on [GPU model] with [RAM] and [CPU]. We implement three evaluation modes. Mode 0 is a brute-force RTF baseline that recomputes all-pairs KNN for every site at every iteration, serving as the unoptimized reference. Mode 1 employs our reusable bitonic KNN structure (Section 3.4) with hub-grid spatial indexing, warm-starting, and mesh KNN caching, but without freezing. Mode 2 adds the curvature-adaptive freeze policy (Section 3.3) on top of Mode 1. All modes use $K = 32$ neighbors, run for 250 Lloyd iterations, and use a displacement threshold of $\epsilon = 0.01 \times R$ where $R$ is the bounding box diagonal. The periodic refresh interval is $R = 50$ iterations.
+All experiments run on an NVIDIA GeForce RTX 4070 Laptop GPU (8 GB VRAM) with an Intel Core i7-14650HX CPU and 16 GB system RAM. We evaluate three configurations: **RTF** [Yao et al. 2023], the prior GPU CVT method that recomputes brute-force KNN for every site at every iteration; **Mode 1**, which replaces RTF's KNN with our reusable bitonic KNN structure (Section 3.4) with hub-grid spatial indexing, warm-starting, and mesh KNN caching, but without freezing. Mode 2 adds the curvature-adaptive freeze policy (Section 3.3) on top of Mode 1. All modes use $K = 32$ neighbors, run for 250 Lloyd iterations, and use a displacement threshold of $\epsilon = 0.01 \times R$ where $R$ is the bounding box diagonal. The periodic refresh interval is $R = 50$ iterations.
 
-Mode 0 is run only on small meshes, as its brute-force KNN makes it prohibitively expensive at larger scales. Modes 1 and 2 are run on all 11 meshes.
+RTF [Yao et al. 2023] is run only on small meshes, as its brute-force KNN makes it prohibitively expensive at larger scales. Modes 1 and 2 are run on all 11 meshes.
 
 **Baseline selection.** We consider three CPU remeshing baselines: Geogram RVD-CVT [Lévy and Liu 2010], CGAL isotropic remeshing [Botsch and Kobbelt 2004], and ACVD [Valette et al. 2008]. Among these, Geogram is the most relevant comparison: it implements exact restricted Voronoi diagram construction via Delaunay triangulation, the CPU-side state of the art for CVT-based remeshing, and consistently produces the highest element quality ($Q_{\mathrm{avg}} \approx 0.929$). CGAL isotropic remeshing uses greedy local operations (split/collapse/flip/smooth) rather than CVT optimization, producing lower quality ($Q_{\mathrm{avg}} \approx 0.85$–$0.90$) at 2–5$\times$ slower runtime than Geogram. ACVD approximates CVT via cluster-based decimation but likewise produces lower quality ($Q_{\mathrm{avg}} \approx 0.88$) and is the slowest of the three (3–7$\times$ slower than Geogram). Since both CGAL and ACVD are strictly dominated by Geogram in both quality and speed, we use Geogram as our primary CPU baseline and report CGAL and ACVD results only for completeness on the small meshes where all methods were evaluated.
 
-Geogram is configured with 250 Lloyd iterations and 0 Newton iterations, with $n_{\mathrm{samples}} = n_{\mathrm{vertices}}$ to match our site count and iteration count for a fair comparison. Geogram is run on the 8 small and medium meshes (up to 544K vertices). At larger scales, Mode 0 and Geogram are not run: extrapolating Geogram's observed $O(n \log n)$ scaling from 544K (117s) to 2.8M yields an estimated runtime of 700–800s, far exceeding Mode 2's 241s and not justifying the computational cost.
+Geogram is configured with 250 Lloyd iterations and 0 Newton iterations, with $n_{\mathrm{samples}} = n_{\mathrm{vertices}}$ to match our site count and iteration count for a fair comparison. Geogram is run on the 8 small and medium meshes (up to 544K vertices). At larger scales, RTF and Geogram are not run: extrapolating Geogram's observed $O(n \log n)$ scaling from 544K (117s) to 2.8M yields an estimated runtime of 700–800s, far exceeding Mode 2's 241s and not justifying the computational cost.
 
 We report four quality metrics: average element quality $Q_{\mathrm{avg}}$ (where 1.0 denotes a perfect equilateral triangle), average minimum angle $\theta_{\min}^{\mathrm{avg}}$, and the percentages of angles below 30° and above 90°.
 
 ## 4.2 Ablation: KNN Reuse and Freeze Contributions
 
-To isolate the contribution of each component, we compare Mode 0 (brute-force), Mode 1 (reusable KNN only), and Mode 2 (reusable KNN + freeze) across all meshes where each mode is available.
+To isolate the contribution of each component, we compare RTF [Yao et al. 2023], Mode 1 (reusable KNN only), and Mode 2 (reusable KNN + freeze) across all meshes where each mode is available.
 
-**Reusable KNN (Mode 0 $\to$ Mode 1).** On the three small meshes where Mode 0 is available, replacing brute-force KNN with our hub-grid bitonic structure yields 5.5–7.9$\times$ speedup. The reusable spatial index avoids the $O(n^2)$ all-pairs scan at every iteration, providing substantial acceleration even without any freezing. The warm-start mechanism further reduces query cost in later iterations when site displacements are small.
+**Reusable KNN (RTF $\to$ Mode 1).** On the three small meshes where RTF is available, replacing RTF's brute-force KNN with our hub-grid bitonic structure yields 5.5–7.9$\times$ speedup. The reusable spatial index avoids RTF's $O(n^2)$ all-pairs scan at every iteration, providing substantial acceleration even without any freezing. The warm-start mechanism further reduces query cost in later iterations when site displacements are small.
 
 **Freeze policy (Mode 1 $\to$ Mode 2).** Adding the freeze policy on top of KNN reuse provides an additional speedup that grows consistently with mesh size:
 
-- Small meshes (35–50K): 1.6–1.8$\times$, with freeze rates of 50–75\%.
-- Medium meshes (112–544K): 1.9–2.7$\times$, with freeze rates of 56–81\%.
-- Large meshes (1.2–2.8M): 3.7–4.2$\times$, with freeze rates exceeding 97\%.
+- Small meshes (35–50K): 1.6–1.8$\times$, with freeze rates of 80–93\%.
+- Medium meshes (112–544K): 1.9–2.7$\times$, with freeze rates of 84–98\%.
+- Large meshes (1.2–2.8M): 3.7–4.2$\times$, with freeze rates of 97–98\%.
 
 The two components are synergistic: the freeze policy progressively removes converged sites from the KNN query set, and the reusable KNN structure's frozen-mask compaction ensures that this sparsity translates directly into proportional wall-clock reduction. Without the compaction mechanism, frozen sites would still consume warp occupancy; without the freeze policy, the compaction has nothing to skip.
 
@@ -62,27 +62,54 @@ Quality is preserved across all three modes. Figure [three_modes_quality] shows 
 
 We examine the freeze policy's behavior in detail to verify that the curvature-adaptive design achieves high freeze rates without compromising output quality.
 
-**Progressive freezing.** The freeze rate rises monotonically over the course of iteration. On medium meshes, sites in flat regions (Tier 0–1) begin freezing around iteration 30–50, once the streak requirement of 10–15 consecutive passes is met. Sites in moderate-curvature regions (Tier 2–3) follow at iteration 60–100. Sites near sharp features (Tier 4) freeze late or remain active throughout, as their longer streak requirements (25–30 iterations) and stricter KNN stability checks reflect the genuine difficulty of convergence in these regions. The final freeze rate on medium meshes ranges from 56\% (happy\_vrip, which has extensive high-curvature regions) to 81\% (Igea, which is predominantly smooth).
+**Progressive freezing.** The freeze rate rises monotonically over the course of iteration. On medium meshes, sites in flat regions (Tier 0–1) begin freezing around iteration 30–50, once the streak requirement of 10–15 consecutive passes is met. Sites in moderate-curvature regions (Tier 2–3) follow at iteration 60–100. Sites near sharp features (Tier 4) freeze late or remain active throughout, as their longer streak requirements (25–30 iterations) and stricter KNN stability checks reflect the genuine difficulty of convergence in these regions. The final freeze rate on medium meshes ranges from 84\% (Bimba) to 98\% (Igea, which is predominantly smooth).
 
 On large meshes, the freeze rate exceeds 97\% on all three test cases. At high sampling density, the surface is dominated by flat regions that gain proportionally more sites, all of which converge early and pass the freeze test quickly. The small fraction of sites near sharp features — typically under 3\% of the total at million-vertex scale — remains active, preserving detail fidelity.
 
 **Quality preservation.** Across all 11 meshes, the quality metrics of Mode 2 (freeze) track those of Mode 1 (no freeze) within negligible margin throughout iteration. The $Q_{\mathrm{avg}}$ curves overlap to within 0.1\%, and the angle distribution metrics (\%$< 30°$, \%$> 90°$) show no systematic divergence. This confirms that the dual-gate test with curvature-scaled streaks successfully avoids false freezing: only sites whose position and neighborhood have genuinely stabilized are removed from KNN queries.
 
-**Per-iteration time reduction.** As the freeze rate grows, Mode 2's per-iteration time drops correspondingly. On medium meshes, Mode 2 is initially comparable to Mode 1 but becomes 2–3$\times$ faster per iteration by iteration 50–100. On large meshes, the per-iteration speedup reaches 4–5$\times$ in the later phase when over 97\% of sites are frozen and only 3\% of the KNN workload remains active.
+**Per-iteration time reduction.** Figure [time_breakdown] shows the per-iteration time breakdown by pipeline stage at iterations 0, 50, 100, and 200. As freezing progresses, total per-iteration time drops by 3–4×: Horse falls from 18.6ms to 5.7ms, Armadillo from 51.4ms to 16.8ms, and Happy Buddha from 284ms to 71ms. KNN query and KNN-to-mesh stages shrink as frozen sites are compacted out, while clipping, centroid, and reprojection remain roughly constant. KNN's share of per-iteration cost ranges from 24–32% at iteration 0 to 42–58% at iteration 200 — it remains the largest single stage even after freezing, confirming that further KNN optimization would compound with the freeze policy.
 
 ## 4.4 Comparison with CPU Baselines
 
 We compare against Geogram's RVD-CVT, the state-of-the-art CPU implementation of surface CVT based on exact restricted Voronoi diagrams with Delaunay triangulation. For a fair comparison, Geogram is configured with 250 Lloyd iterations (matching our iteration count) and $n_{\mathrm{samples}} = n_{\mathrm{vertices}}$ (matching our site count).
 
-On small meshes (35–50K vertices), Mode 2 is 8.0–10.4$\times$ faster than Geogram while achieving comparable quality ($Q_{\mathrm{avg}} \approx 0.917$ vs. Geogram's 0.929). The quality gap of approximately 1.2\% is inherent to the tangent-plane approximation used by all KNN-based CVT methods versus Geogram's exact RVD computation; it is not caused by freezing, as Mode 1 (without freeze) produces the same quality.
+On small meshes (35–50K vertices), Mode 2 is 8.0–10.4$\times$ faster than Geogram while achieving comparable quality ($Q_{\mathrm{avg}} \approx 0.926$ vs. Geogram's 0.929). The quality gap of approximately 0.3\% is inherent to the tangent-plane approximation used by all KNN-based CVT methods versus Geogram's exact RVD computation; it is not caused by freezing, as Mode 1 (without freeze) produces the same quality.
 
 On medium meshes (112–544K), Mode 2 maintains a 3.1–8.5$\times$ speedup over Geogram. At the largest medium mesh (happy\_vrip, 544K), Geogram takes 117 seconds while Mode 2 completes in 27 seconds, a 4.3$\times$ advantage. The freeze policy is essential at this scale: Mode 1 alone achieves only 1.8$\times$ over Geogram, while Mode 2's freeze-driven compaction provides the additional factor needed to maintain a clear advantage.
 
-On large meshes (1.2–2.8M vertices), Geogram is not run. Extrapolating from its observed $O(n \log n)$ per-iteration scaling — 117 seconds at 544K vertices — we estimate a runtime on the order of 700–800 seconds for 2.8M vertices (Samothrace). Mode 2 completes the same mesh in 241 seconds, approximately 3$\times$ faster than the extrapolated baseline. Mode 0 (brute-force RTF) is also not run at this scale; its $O(n^2)$ KNN cost would require hours. At million-vertex scale, only Mode 2 with freeze-aware KNN reuse produces results within a practical time budget.
+On large meshes (1.2–2.8M vertices), Geogram is not run. Extrapolating from its observed $O(n \log n)$ per-iteration scaling — 117 seconds at 544K vertices — we estimate a runtime on the order of 700–800 seconds for 2.8M vertices (Samothrace). Mode 2 completes the same mesh in 241 seconds, approximately 3$\times$ faster than the extrapolated baseline. RTF is also not run at this scale; its $O(n^2)$ KNN cost would require hours. At million-vertex scale, only Mode 2 with freeze-aware KNN reuse produces results within a practical time budget.
 
-## 4.5 Scalability
+## 4.5 Memory Footprint
 
-The central result of our evaluation is that the freeze advantage grows consistently with mesh size. The Mode 1 $\to$ Mode 2 speedup increases from 1.6–1.8$\times$ at 35–50K vertices, through 1.9–2.7$\times$ at 112–544K, to 3.7–4.2$\times$ at 1.2–2.8M. This trend is driven by a simple geometric argument: at higher sampling density, flat regions of the surface — which dominate most meshes — are represented by proportionally more sites. These flat-region sites converge rapidly and pass the freeze test early, while the fraction of sites near sharp features shrinks relative to the total count. The result is that the freeze rate grows from 50–75\% at small scale to over 97\% at million-vertex scale.
+Peak GPU memory (measured via nvidia-smi) during Mode 2:
+
+| Mesh | Vertices | Peak GPU (MiB) |
+|---|---|---|
+| stanford-bunny | 34,834 | 566 |
+| horse | 48,485 | 566 |
+| Armadillo | 172,974 | 1,524 |
+| dragon_vrip | 437,645 | 3,638 |
+| happy_vrip | 543,652 | 4,502 |
+| Samothrace | 2,836,106 | 5,494 |
+
+Memory scales sublinearly: 58× more vertices requires only 9.7× more memory because Voronoi polygon buffers (N×256 slots) use CUDA virtual memory with lazy physical backing. On 8 GB VRAM, the practical limit is ~3.5–4M vertices.
+
+## 4.6 Parameter Sensitivity
+
+We vary five freeze-policy parameters one at a time on Horse (48K) and Armadillo (172K). The results reveal a clean separation: periodic KNN refresh controls correctness, while all other parameters control only efficiency.
+
+**Refresh interval R** is the only parameter whose extreme setting degrades quality: R=∞ (no refresh) reduces Armadillo Qavg from 0.933 to 0.925. For any finite R≤200, quality is preserved within 0.001. Runtime is unaffected — refresh overhead is ~2%.
+
+**Streak lengths** control freeze aggressiveness. Short streaks {5..15} achieve 97% freeze and 1.4× faster runtime than long {20..40} (87% freeze). Quality varies by <0.001 because refresh bounds error from premature freezing.
+
+**NV tier boundaries, Kc/K ratio, and warmup T₀** have minimal effect. NV and warmup produce <0.1% variation. Stricter Kc/K (100% all tiers) slows runtime by 1.5× without quality benefit.
+
+The method requires no per-mesh tuning: refresh provides correctness, other parameters have a wide safe operating range.
+
+## 4.6 Scalability
+
+The central result of our evaluation is that the freeze advantage grows consistently with mesh size. The Mode 1 $\to$ Mode 2 speedup increases from 1.6–1.8$\times$ at 35–50K vertices, through 1.9–2.7$\times$ at 112–544K, to 3.7–4.2$\times$ at 1.2–2.8M. This trend is driven by a simple geometric argument: at higher sampling density, flat regions of the surface — which dominate most meshes — are represented by proportionally more sites. These flat-region sites converge rapidly and pass the freeze test early, while the fraction of sites near sharp features shrinks relative to the total count. The result is that the freeze rate grows from 80–93\% at small scale to over 97\% at million-vertex scale.
 
 The practical consequences are significant. On the Samothrace mesh (2.84M vertices), Mode 1 without freezing takes 16.7 minutes. Mode 2 with freeze completes the same 250 iterations in 4.0 minutes — a 4.2$\times$ reduction. On Trumpet (1.23M), Mode 2 reduces 3.7 minutes to 53 seconds. Without the freeze policy, GPU-based CVT at million-vertex scale is impractical for iterative design workflows; with it, the runtime falls within a range that permits interactive exploration of remeshing parameters.
 

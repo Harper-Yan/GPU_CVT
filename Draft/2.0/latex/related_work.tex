@@ -1,0 +1,91 @@
+\section{Related Work}
+\label{sec:related}
+
+\subsection{Isotropic Remeshing}
+
+Isotropic surface remeshing seeks to redistribute vertices so as to produce well-shaped, nearly equilateral triangles. The problem has been approached through several fundamentally different strategies. Greedy local methods apply sequences of edge splits, collapses, flips, and tangential smoothing~\cite{hoppe1996progressive, botsch2004remeshing, dunyach2013adaptive}. These pipelines are simple to implement and handle topology changes gracefully, but their convergence is heuristic: no energy is minimized, and element quality depends heavily on the number of smoothing passes. Particle-based methods~\cite{turk1992retiling, witkin1994particles} distribute vertices by mutual repulsion, producing approximately uniform distributions but converging slowly and offering no direct control over the resulting tessellation. Variational and parameterization-based approaches~\cite{alliez2003anisotropic, alliez2005centroidal, cohensteiner2004variational} achieve high quality through global optimization but require a valid surface parameterization whose cost is superlinear in mesh size. Optimal-transport formulations~\cite{degoes2012blue, mehta2012blue} yield excellent point distributions at the expense of specialized solvers that limit practical scale to a few thousand sites. More recently, learning-based methods~\cite{liu2020neural, potamias2022neural, sharp2022diffusion} target different quality objectives such as feature preservation and task-specific adaptation, though generalization to unseen geometry remains an open challenge. We note that many remeshing methods---including greedy, variational, and CVT-based approaches---can incorporate curvature-driven sizing fields to place more sites in regions of high geometric detail~\cite{alliez2003anisotropic, dunyach2013adaptive, levy2010lp}. Power diagrams (weighted Voronoi diagrams) generalize CVT by assigning per-site weights to produce non-uniform cell sizes adapted to a prescribed density~\cite{aurenhammer1987power, degoes2012blue}, and GPU implementations such as PowerRTF~\cite{yao2023rtf} have extended this to the tangent-plane framework. In this work, we focus on isotropic (uniform) remeshing; our acceleration applies to the Lloyd iteration structure shared by both uniform and adaptive variants, though the experimental evaluation is restricted to the uniform case. Among the families surveyed above, centroidal Voronoi tessellation (CVT) occupies a unique position: it minimizes a well-defined energy functional and produces provably optimal point distributions, yielding the highest isotropic element quality among non-learning methods---but at a computational cost that has historically limited its practical scale.
+
+\subsection{CVT-Based Remeshing}
+
+A centroidal Voronoi tessellation minimizes the CVT energy functional, in which each generating site coincides with the centroid of its Voronoi cell~\cite{du1999cvt}. Lloyd's algorithm~\cite{lloyd1982} iteratively computes each site's Voronoi cell and moves the site to the cell centroid; for surface remeshing this is carried out in the restricted Voronoi diagram (RVD), where the Voronoi diagram is clipped to the surface~\cite{du2003surface}. The algorithm converges at a linear rate~\cite{du2006acceleration}, meaning that many iterations are typically required to reach a high-quality tessellation.
+
+Yan et al.~\cite{yan2009rvd} gave the first practical surface CVT via exact RVD computation, and subsequent work extended the framework to $L_p$ norms~\cite{levy2010lp}, guaranteed non-obtuse output~\cite{yan2016nonobtuse}, and large-scale evaluations up to 100K vertices~\cite{yan2014clipped}. Weighted variants based on power diagrams~\cite{aurenhammer1987power, degoes2012blue, budninskiy2016power} allow adaptive resolution through per-site weights, addressing a complementary concern to ours.
+
+A key observation is that each Lloyd iteration involves the same sequence of operations---KNN query, Voronoi clipping, centroid computation, and surface projection---applied uniformly to \emph{every} site, regardless of whether that site has already converged. Combined with linear convergence, this uniform treatment makes CVT expensive: most published methods evaluate on meshes of at most 50K--100K vertices.
+
+\subsection{GPU-Accelerated CVT}
+
+GPU parallelism is a natural fit for Lloyd iteration, since each site's update is independent. Rong and Tan~\cite{rong2006jump} introduced jump flooding for discrete Voronoi diagrams on GPU, and Rong et al.~\cite{rong2011gpu} extended the approach to surface CVT at up to 50K sites. L\'{e}vy and Liu~\cite{levy2010lp} demonstrated GPU-accelerated $L_p$-CVT at similar scale. Ray et al.~\cite{ray2018hex} applied GPU parallelism to restricted Voronoi diagrams for hex-dominant meshing. Basselin et al.~\cite{basselin2021restricted} proposed a GPU method for evaluating integrals over restricted power diagram cells without explicit diagram construction, using adaptive per-cell scheduling that assigns different neighbor counts to geometrically difficult cells near domain boundaries. Their method achieves 2--3$\times$ speedup over prior GPU Voronoi methods and approximately 50$\times$ over CPU implementations; however, it operates on tetrahedral domains rather than surface CVT, performs a single-shot diagram evaluation rather than iterative Lloyd optimization, and lacks curvature awareness.
+
+Despite these advances, a consistent pattern across all prior GPU-CVT work is that every Lloyd iteration treats all sites uniformly: KNN, clipping, and centroid computation are performed for every site regardless of convergence state. Basselin et al.'s per-cell adaptive scheduling comes closest to non-uniform treatment, but it adapts to diagram \emph{construction} difficulty rather than to convergence state. Parallelism reduces wall-clock time per iteration but does not eliminate redundant computation on sites that have already stabilized.
+
+\subsection{Delaunay vs.\ KNN-Based CVT}
+
+Two fundamentally different algorithmic strategies exist for finding each site's Voronoi neighbors in surface CVT, and their complexity profiles diverge sharply at scale. Understanding this divergence---and the specific failure modes of existing GPU KNN methods---motivates the design of our system.
+
+\subsubsection{Two Families and the Scaling Crossover}
+
+The CPU Delaunay approach, exemplified by Geogram~\cite{levy2010lp, yan2009rvd, yan2014clipped}, computes the exact restricted Voronoi diagram via Delaunay triangulation. The per-iteration cost is dominated by Delaunay construction at $O(n \log n)$ expected time, and decades of engineering---BRIO ordering, exact arithmetic predicates, cache-friendly traversal---have made this approach highly efficient. We use Geogram's \texttt{remesh\_smooth} configured with 250 Lloyd iterations and 0 Newton iterations as our CPU baseline, matching our iteration count for a fair comparison.
+
+The GPU KNN-based approach, adopted by RTF~\cite{yao2023rtf} and subsequent tangent-plane methods~\cite{fei2025adaptive}, replaces Delaunay triangulation with a $K$-nearest-neighbor query ($K=32$ in our implementation) to identify each site's Voronoi neighbors. This yields a per-iteration cost of $O(n \cdot K)$ that is massively parallelizable on GPU, but every site recomputes its KNN from scratch at every iteration. KNN typically accounts for 60--80\% of iteration time, making it the dominant bottleneck.
+
+At small scale, GPU parallelism compensates for the redundant per-site KNN: on the Stanford Bunny ($\sim$35K sites), our RTF baseline ($\sim$1.2s) is competitive with Geogram ($\sim$1.3s). However, the crossover occurs around 40--50K sites. At $\sim$50K sites (Horse, Nefertiti), Geogram ($\sim$1.7s) is already faster than RTF ($\sim$2.3s). At 112--134K sites (Bimba, Igea), Geogram is 2.8--3.4$\times$ faster. The gap widens with scale because Delaunay's $O(n \log n)$ cost grows sublinearly per site, while KNN's $O(n \cdot K \cdot T)$ cost ($T$ iterations) grows linearly. This crossover undermines the premise of GPU-accelerated CVT: beyond moderate scale, brute-force KNN on GPU is slower than optimized CPU Delaunay.
+
+\subsubsection{Why Existing GPU KNN Approaches Fail for CVT}
+
+The KNN problem in iterative CVT has three distinctive properties that stress conventional GPU KNN methods: sites move every iteration, requiring repeated queries rather than a single batch; sites are distributed non-uniformly on the surface, with higher density in regions of high curvature; and $K=32$ exact neighbors are needed per site, as approximate results risk incorrect Voronoi cell topology.
+
+Brute-force GPU KNN~\cite{garcia2008knn} computes all pairwise distances at $O(n^2)$ cost per batch. It is simple to implement with high GPU occupancy and performs adequately at small scale, but becomes prohibitive as $n$ grows---at 100K sites, each iteration evaluates $10^{10}$ distance pairs. RTF~\cite{yao2023rtf} effectively relies on this approach, which explains its practical limit of approximately 30K sites.
+
+Uniform-grid spatial hashing~\cite{teschner2003hashing, green2008cuda} partitions space into fixed-size cells and queries only nearby cells, achieving $O(n)$ build cost and $O(K \cdot \rho)$ query cost where $\rho$ is the local cell density. When the point distribution is roughly uniform, this is fast. However, surface CVT sites are inherently non-uniform: curvature-adapted densities and surface geometry create clustering in some regions and sparsity in others. A grid cell size tuned to the densest region wastes memory and causes poor cache behavior in flat areas; a cell size tuned to average density leads to overflow in dense regions, requiring expensive fallback scans. Moreover, the grid must be fully reconstructed every iteration, with no natural mechanism for partial updates when only a fraction of sites have moved.
+
+\subsubsection{Spatio-Graph KNN and the Case for CLOVER}
+
+CLOVER~\cite{kamel2025clover} introduces a GPU-native exact KNN method based on a spatio-graph structure. Points are organized into spatial hubs whose sizes adapt to local density, and a graph of hub adjacencies guides the neighbor search. Within each hub, a warp-level bitonic sort enables efficient local KNN computation. Because hub granularity adjusts to the point distribution rather than imposing a fixed grid resolution, CLOVER handles non-uniform distributions natively---precisely the regime in which surface CVT operates.
+
+Several properties of CLOVER's design make it particularly well-suited for iterative CVT with a freeze policy. First, the hub structure supports \emph{partial rebuilds}: when only a subset of sites move (the unfrozen sites in our framework), only the affected hubs require updating, avoiding a full reconstruction at every iteration. Second, previous KNN results can \emph{warm-start} the next iteration's search by seeding with the prior neighbor set, reducing the effective search radius when site displacement is small. Third, CLOVER produces exact results, which is essential for correct Voronoi cell construction. Fourth, by compacting only unfrozen queries into the active work set, the per-iteration cost scales with the number of \emph{active} sites rather than the total site count---a property that becomes increasingly valuable as more sites freeze over the course of convergence.
+
+No prior work combines a KNN structure with these reuse-capable properties with a convergence-aware freeze policy for CVT. Brute-force KNN fails at scale; uniform-grid KNN fails on non-uniform distributions; and while CLOVER solves the distribution and reuse problems, it has not previously been applied in an iterative setting where a freeze policy progressively reduces the active query set. Our work is the first to close this loop.
+
+\subsection{RTF and Tangent-Plane Methods}
+
+Recent GPU-CVT methods focus on improving what happens \emph{within} each Lloyd iteration---the accuracy or efficiency of per-site Voronoi cell computation---rather than reducing which sites require computation.
+
+Yao et al.~\cite{yao2023rtf} introduced restricted tangent-face (RTF) construction and its power-diagram variant PowerRTF, computing tangent-plane Voronoi facets directly on GPU without auxiliary points or full Voronoi traversal. Their method evaluates on meshes up to approximately 30K sites. We build on the same tangent-plane Lloyd framework. Fei et al.~\cite{fei2025adaptive} proposed curvature-adaptive multi-facet clipping, in which each Voronoi cell is clipped against one to three original mesh facets depending on local curvature (determined by the cosine angle between neighboring facet normals). This improves Voronoi cell accuracy at high curvature compared to single-tangent-plane methods, achieving higher element quality than PowerRTF at the cost of slower per-iteration speed, with evaluations on meshes up to 100K input vertices with 3K--9K output sites. In 2025, CGAL added an approximated discrete CVT remesher that uses entirely discrete geometry processing and scales to several million triangles with low memory overhead.
+
+These approaches address a complementary bottleneck to ours: they improve the accuracy or approximation quality of each Lloyd iteration, while we reduce the number of sites that require computation per iteration. The two strategies are orthogonal and could be combined---for example, curvature-adaptive clipping could be applied to active sites while frozen sites skip computation entirely.
+
+\subsection{Convergence Non-Uniformity}
+
+The theoretical analysis of Du and Emelianenko~\cite{du2006acceleration} establishes a global linear convergence rate for Lloyd iteration but does not address spatial variation in convergence speed across the domain. In practice, sites in flat, geometrically simple regions stabilize within tens of iterations, while sites near sharp features, high curvature, or thin structures continue to oscillate for much longer. This spatially non-uniform convergence behavior is well-known empirically but has not been exploited algorithmically in any prior CVT method.
+
+Analogous ideas appear in other computational domains. Adaptive mesh refinement (AMR) in PDE solvers concentrates computational effort in regions where the solution error is largest~\cite{berger1984amr}. Active-set methods in constrained optimization skip satisfied constraints to reduce per-iteration cost. Asynchronous iterative solvers allow individual components to converge independently. However, none of these techniques have been applied to CVT, where every prior method---CPU or GPU, exact or approximate---treats all sites uniformly at every iteration.
+
+\subsection{Our Contribution in Context}
+
+Our work sits at the intersection of tangent-plane CVT (building on the RTF framework), GPU-parallel Lloyd iteration, and GPU-native KNN computation. We introduce two novel components: (1)~a spatially adaptive, curvature-aware freeze policy that identifies and skips converged sites using a five-tier scheme with per-tier displacement and KNN stability thresholds, and (2)~a reusable bitonic KNN structure, inspired by CLOVER's spatio-graph design, that supports warm-starting from previous results and scales with the active (unfrozen) site count rather than the total.
+
+Compared to RTF and PowerRTF~\cite{yao2023rtf}, we operate in the same tangent-plane framework but eliminate redundant computation on converged sites. Compared to curvature-adaptive clipping~\cite{fei2025adaptive}, our acceleration is orthogonal: they improve per-site accuracy while we reduce the number of sites computed per iteration. Compared to all prior GPU-CVT methods, ours is the first to exploit the spatially non-uniform convergence behavior of Lloyd iteration. Most critically, compared to CPU Delaunay methods (Geogram), where RTF loses its speed advantage beyond approximately 50K sites due to repetitive KNN, our freeze policy and reusable KNN structure restore the GPU advantage, making KNN-based CVT consistently faster than CPU Delaunay across all tested scales while maintaining equivalent mesh quality.
+
+\begin{table}[t]
+\centering
+\caption{Representative remeshing methods and their reported maximum evaluation scale.}
+\label{tab:related_scale}
+\begin{tabular}{llcr}
+\hline
+\textbf{Method} & \textbf{Category} & \textbf{Year} & \textbf{Max scale} \\
+\hline
+Turk~\cite{turk1992retiling} & Particle & 1992 & $\sim$5K \\
+Alliez et al.~\cite{alliez2003anisotropic} & Variational & 2003 & $\sim$30K \\
+Botsch and Kobbelt~\cite{botsch2004remeshing} & Greedy local & 2004 & $\sim$100K \\
+Yan et al.~\cite{yan2009rvd} & RVD-CVT & 2009 & $\sim$50K \\
+Fuhrmann et al.~\cite{fuhrmann2010direct} & Direct resampling & 2010 & $\sim$500K \\
+L\'{e}vy and Liu~\cite{levy2010lp} & GPU-CVT & 2010 & $\sim$50K \\
+Rong et al.~\cite{rong2011gpu} & GPU-CVT & 2011 & $\sim$50K \\
+Yan et al.~\cite{yan2014clipped} & RVD-CVT & 2014 & $\sim$100K \\
+Yao et al.~\cite{yao2023rtf} & GPU RTF/PowerRTF & 2023 & $\sim$30K sites \\
+Fei et al.~\cite{fei2025adaptive} & Adaptive clipping & 2025 & $\sim$100K input \\
+\textbf{Ours} & \textbf{Freeze + Reusable KNN} & \textbf{2025} & \textbf{$\sim$2{,}840K sites} \\
+\hline
+\end{tabular}
+\end{table}

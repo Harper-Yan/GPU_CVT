@@ -5,7 +5,7 @@
 | Topic | Key point |
 |-------|-----------|
 | 5.1 Relationship to CVT energy | Freezing fixes stale KNN, breaking formal energy descent; periodic refresh bounds error; empirically quality preserved |
-| 5.2 Tangent-plane quality gap | Q_avg ~0.917 vs Geogram ~0.929 is from tangent-plane approximation, not freezing; shared by all KNN-based CVT |
+| 5.2 Tangent-plane quality gap | Q_avg ~0.926 vs Geogram ~0.929 is from tangent-plane approximation, not freezing; shared by all KNN-based CVT |
 | 5.3 Why speedup scales with mesh size | KNN dominates cost; larger meshes have more flat sites that freeze early; fixed overheads dilute at small scale |
 | 5.4 Freeze rate vs. speedup | Final freeze % doesn't fully predict speedup — when sites freeze matters; KNN backend contributes independently |
 | 5.5 Limitations | Empirical thresholds; centroid not skipped; irreversible; uniform CVT only; large meshes lack full baselines |
@@ -23,7 +23,7 @@ A formal analysis of CVT energy behavior under partial site freezing — boundin
 
 ## 5.2 The Tangent-Plane Quality Gap
 
-Across all meshes, our method produces $Q_{\mathrm{avg}} \approx 0.917$ compared to Geogram's $Q_{\mathrm{avg}} \approx 0.929$, a gap of approximately 1.2\%. This gap is not caused by the freeze policy: Mode 1 (reusable KNN without freezing) achieves the same quality as Mode 2 (with freezing), confirming that the freeze mechanism does not degrade the output.
+Across all meshes, our method produces $Q_{\mathrm{avg}} \approx 0.926$ compared to Geogram's $Q_{\mathrm{avg}} \approx 0.929$, a gap of approximately 0.3\%. This gap is not caused by the freeze policy: Mode 1 (reusable KNN without freezing) achieves the same quality as Mode 2 (with freezing), confirming that the freeze mechanism does not degrade the output.
 
 The gap is inherent to the tangent-plane approximation used by all KNN-based CVT methods, including RTF [Yao et al. 2023] and multi-facet clipping [Fei et al. 2025]. The tangent-plane construction projects 3D Voronoi geometry onto a local 2D plane, introducing distance distortion that grows with local curvature (Section 3.2, Mechanism 1). Geogram, by contrast, computes the exact restricted Voronoi diagram via Delaunay triangulation, avoiding this approximation entirely. The quality gap is the price paid for the simpler GPU-friendly tangent-plane framework — a trade-off shared by all methods in this family and independent of our freeze contribution.
 
@@ -41,13 +41,13 @@ Second, the freeze rate itself increases with mesh size. At higher sampling dens
 
 The final freeze rate (fraction of sites frozen at the last iteration) does not perfectly predict total speedup for two reasons.
 
-First, the *timing* of freezing matters. Speedup depends on the time-weighted integral of the frozen fraction across all iterations, not just the terminal value. A mesh where sites freeze gradually over 200 iterations accumulates less savings than one where most sites freeze within the first 30 iterations, even if both reach the same final freeze rate. This explains why Armadillo (79\% frozen, most sites freezing early) achieves 2.5$\times$ while happy\_vrip (56\% frozen at a different pace) achieves 2.4$\times$ — the relationship between final freeze rate and speedup is modulated by the freeze curve shape.
+First, the *timing* of freezing matters. Speedup depends on the time-weighted integral of the frozen fraction across all iterations, not just the terminal value. A mesh where sites freeze gradually over 200 iterations accumulates less savings than one where most sites freeze within the first 30 iterations, even if both reach the same final freeze rate. This explains why Armadillo (95\% frozen, most sites freezing early) achieves 2.5$\times$ while happy\_vrip (93\% frozen at a different pace) achieves 2.4$\times$ — the relationship between final freeze rate and speedup is modulated by the freeze curve shape.
 
-Second, the reusable KNN backend contributes speedup independently of freezing. The hub-grid bitonic structure with warm-starting is inherently faster than brute-force KNN even for the unfrozen queries, because it exploits spatial locality and seeds each query with the previous iteration's result. Mode 1 (no freeze) already achieves 5.5–7.9$\times$ over Mode 0 on small meshes, entirely from KNN structure improvements. The reported Mode 1 $\to$ Mode 2 speedups isolate the freeze contribution on top of this already-optimized baseline.
+Second, the reusable KNN backend contributes speedup independently of freezing. The hub-grid bitonic structure with warm-starting is inherently faster than brute-force KNN even for the unfrozen queries, because it exploits spatial locality and seeds each query with the previous iteration's result. Mode 1 (no freeze) already achieves 5.5–7.9$\times$ over RTF [Yao et al. 2023] on small meshes, entirely from KNN structure improvements. The reported Mode 1 $\to$ Mode 2 speedups isolate the freeze contribution on top of this already-optimized baseline.
 
 ## 5.5 Limitations
 
-**Empirically calibrated thresholds.** The NV tier boundaries $\{0.15, 0.35, 0.55, 0.80\}$ and streak lengths $\{10, 15, 20, 25, 30\}$ are chosen based on observed breakpoints in convergence instability metrics. No systematic sensitivity analysis or hyperparameter optimization has been performed. The thresholds produce consistent results across our 11-mesh benchmark, but generalization to meshes with unusual curvature distributions (e.g., predominantly sharp features with minimal flat area) is not guaranteed.
+**Empirically calibrated thresholds.** The NV tier boundaries {0.15, 0.35, 0.55, 0.80} and streak lengths {10, 15, 20, 25, 30} are chosen based on observed breakpoints in convergence instability metrics. Our sensitivity study (Section 4.5) shows that quality is insensitive to these choices — varying all five parameters across their tested ranges changes Qavg by less than 0.002 — but generalization to meshes with unusual curvature distributions (e.g., predominantly sharp features with minimal flat area) is not guaranteed.
 
 **Centroid and projection are not skipped.** Our policy only removes frozen sites from KNN queries. Voronoi clipping, centroid computation, and reprojection run for all sites at every iteration, because unfrozen neighbors may still reshape frozen sites' Voronoi cells. Speedup is therefore bounded by the fraction of iteration time spent in KNN. On implementations where clipping or projection is expensive relative to KNN, the freeze policy would yield smaller gains.
 
@@ -55,7 +55,9 @@ Second, the reusable KNN backend contributes speedup independently of freezing. 
 
 **Uniform isotropic CVT only.** The current method assumes standard unweighted CVT, where all sites have equal weight and the target tessellation is uniform. In power diagrams (weighted Voronoi), sites carry weights that produce non-uniform cell sizes, and convergence dynamics near density transitions may differ. Extending the freeze policy to weighted CVT would require adapting the displacement threshold and KNN stability criteria to account for weight-induced asymmetries.
 
-**Incomplete baselines at large scale.** Mode 0 and Geogram are not run on the three large meshes (1.2–2.8M) due to prohibitive runtime. While extrapolation from observed scaling trends strongly suggests that Mode 2 is faster, the absence of direct measurements at this scale is a limitation. The large-mesh evaluation is restricted to the Mode 1 vs. Mode 2 comparison.
+**Reduced benefit on high-curvature meshes.** The freeze advantage depends on having a substantial fraction of flat sites that converge early. Nefertiti — our worst case — has extensive high-curvature regions, reaching only 80% freeze rate and 1.6× Mode 1→Mode 2 speedup, compared to 98% and 2.4× on Igea. On a hypothetical mesh dominated entirely by sharp features, the freeze rate would be low and the speedup minimal, as few sites would pass the curvature-scaled streak test. The method remains correct in this regime (quality tracks the unfrozen baseline) but provides little acceleration.
+
+**Incomplete baselines at large scale.** RTF and Geogram are not run on the three large meshes (1.2–2.8M) due to prohibitive runtime. While extrapolation from observed scaling trends strongly suggests that Mode 2 is faster, the absence of direct measurements at this scale is a limitation. The large-mesh evaluation is restricted to the Mode 1 vs. Mode 2 comparison.
 
 ## 5.6 Generality and Future Work
 

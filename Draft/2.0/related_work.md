@@ -44,7 +44,7 @@ Two fundamentally different algorithmic strategies exist for finding each site's
 
 ### 2.4.1 Two Families and the Scaling Crossover
 
-The CPU Delaunay approach, exemplified by Geogram [Lévy and Liu 2010; Yan et al. 2009, 2014], computes the exact restricted Voronoi diagram via Delaunay triangulation. The per-iteration cost is dominated by Delaunay construction at $O(n \log n)$ expected time, and decades of engineering — BRIO ordering, exact arithmetic predicates, cache-friendly traversal — have made this approach highly efficient. We use Geogram's `remesh_smooth` (5 Lloyd + 30 Newton iterations) as our CPU baseline.
+The CPU Delaunay approach, exemplified by Geogram [Lévy and Liu 2010; Yan et al. 2009, 2014], computes the exact restricted Voronoi diagram via Delaunay triangulation. The per-iteration cost is dominated by Delaunay construction at $O(n \log n)$ expected time, and decades of engineering — BRIO ordering, exact arithmetic predicates, cache-friendly traversal — have made this approach highly efficient. We use Geogram's `remesh_smooth` configured with 250 Lloyd iterations and 0 Newton iterations as our CPU baseline, matching our iteration count for a fair comparison.
 
 The GPU KNN-based approach, adopted by RTF [Yao et al. 2023] and subsequent tangent-plane methods [Fei et al. 2025], replaces Delaunay triangulation with a $K$-nearest-neighbor query ($K=32$ in our implementation) to identify each site's Voronoi neighbors. This yields a per-iteration cost of $O(n \cdot K)$ that is massively parallelizable on GPU, but every site recomputes its KNN from scratch at every iteration. KNN typically accounts for 60–80\% of iteration time, making it the dominant bottleneck.
 
