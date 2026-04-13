@@ -79,6 +79,27 @@ __device__ __forceinline__ float2 poly_centroid_2d(const float2* poly, int n) {
     return make_float2(Cx * inv6A, Cy * inv6A);
 }
 
+// CVT energy of polygon w.r.t. origin: integral of ||x||^2 dA
+// Uses same fan triangulation as centroid. Returns absolute value.
+__device__ __forceinline__ double poly_energy_2d(const float2* poly, int n) {
+    if (n < 3) return 0.0;
+    double E = 0.0;
+    for (int i = 0; i < n; ++i) {
+        float2 p = poly[i];
+        float2 q = poly[(i + 1) % n];
+        float cr = p.x * q.y - q.x * p.y;  // 2 * signed area of triangle (O, p, q)
+        // integral of ||x||^2 over triangle (O, p, q) = (area/6)(||p||^2 + ||q||^2 + p·q)
+        // area = cr/2, so contribution = (cr/12)(||p||^2 + ||q||^2 + p·q)
+        double d_pp = (double)p.x*p.x + (double)p.y*p.y;
+        double d_qq = (double)q.x*q.x + (double)q.y*q.y;
+        double d_pq = (double)p.x*q.x + (double)p.y*q.y;
+        E += (double)cr * (d_pp + d_qq + d_pq);
+    }
+    // E currently = sum of cr*(d_pp+d_qq+d_pq), need to divide by 12
+    E /= 12.0;
+    return (E > 0.0) ? E : -E;
+}
+
 __global__ void centroids_tangent_voronoi(const float3* __restrict__ S,
                                           const float3* __restrict__ U,
                                           const float3* __restrict__ V,
@@ -86,7 +107,8 @@ __global__ void centroids_tangent_voronoi(const float3* __restrict__ S,
                                           int nV, int K,
                                           float R,
                                           const unsigned char* dFrozen,
-                                          float3* __restrict__ cent3d)
+                                          float3* __restrict__ cent3d,
+                                          double* __restrict__ energy_out = nullptr)  // optional per-site CVT energy
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= nV) return;
@@ -123,6 +145,13 @@ __global__ void centroids_tangent_voronoi(const float3* __restrict__ S,
 
         // swap poly buffers
         for (int k = 0; k < nPoly; ++k) polyA[k] = polyB[k];
+    }
+
+    // Compute CVT energy from the same clipped polygon (no re-clipping).
+    // Skip frozen sites: their stale KNN produces incorrect polygons.
+    // The buffer retains each frozen site's last valid energy from before it was frozen.
+    if (energy_out && (!dFrozen || !dFrozen[i])) {
+        energy_out[i] = poly_energy_2d(polyA, nPoly);
     }
 
     float2 c2 = poly_centroid_2d(polyA, nPoly);

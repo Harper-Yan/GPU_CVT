@@ -334,6 +334,78 @@ __global__ void freeze_test_kernel_streak_tiered(
     freezeCand[i] = (s >= need) ? 1 : 0;
 }
 
+// ─── Ablation variant: gate_mask controls which gates are active ───
+// gate_mask: 0x3 = both gates (full method), 0x1 = gate1 only (displacement), 0x2 = gate2 only (KNN stability)
+template<int K, typename IndexT>
+__global__ void freeze_test_kernel_streak_tiered_ablation(
+    const float3* __restrict__ S,
+    const float3* __restrict__ Snew,
+    const IndexT* __restrict__ knn,
+    const IndexT* __restrict__ prev_knn,
+    unsigned char* __restrict__ freezeCand,
+    unsigned char* __restrict__ streak,
+    const unsigned char* __restrict__ tier_id,
+    const float* __restrict__ thresh2_per_tier,
+    const int* __restrict__ streak_per_tier,
+    const float* __restrict__ jaccard_per_tier,
+    int nV,
+    int has_prev_knn,
+    int gate_mask,           // 0x3=both, 0x1=gate1 only, 0x2=gate2 only
+    int* __restrict__ counts
+){
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= nV) return;
+
+    if (!has_prev_knn) {
+        streak[i] = 0;
+        freezeCand[i] = 0;
+        return;
+    }
+
+    int t = (int)tier_id[i];
+    if (t < 0) t = 0;
+    if (t > 5) t = 5;
+    float thresh2 = thresh2_per_tier[t];
+    int need = streak_per_tier[t] - 1;
+    if (need < 1) need = 1;
+    float jacc_thr = jaccard_per_tier[t];
+
+    // Gate 2: KNN stability
+    int K_check = (int)(jacc_thr * K + 0.5f);
+    if (K_check < 1) K_check = 1;
+    if (K_check > K) K_check = K;
+    bool same = true;
+    for (int j = 0; j < K_check; ++j) {
+        if (knn[i*K + j] != prev_knn[i*K + j]) { same = false; break; }
+    }
+
+    // Gate 1: displacement
+    float3 a = S[i];
+    float3 b = Snew[i];
+    float dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+    bool low = (dx*dx + dy*dy + dz*dz) <= thresh2;
+
+    // Apply gate mask
+    bool pass;
+    if (gate_mask == 0x1)      pass = low;          // gate1 only
+    else if (gate_mask == 0x2) pass = same;         // gate2 only
+    else                       pass = same && low;  // both (default)
+
+    if (same) atomicAdd(&counts[0], 1);
+    if (low)  atomicAdd(&counts[1], 1);
+    if (pass) atomicAdd(&counts[2], 1);
+
+    unsigned char s = streak[i];
+    if (pass) {
+        if (s < 255) s++;
+    } else {
+        s = 0;
+    }
+    streak[i] = s;
+
+    freezeCand[i] = (s >= need) ? 1 : 0;
+}
+
 // ─── Peak-displacement freeze: replaces dual-gate with sliding-window max displacement ───
 template<int K, typename IndexT>
 __global__ void freeze_test_peak_disp(

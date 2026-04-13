@@ -549,3 +549,12 @@ static void append_eval_iters_csv(
         << "\n";
 }
 
+// ─── CVT Energy: sum per-site energies computed during centroid clipping ───
+// Energy is written by centroids_tangent_voronoi(..., energy_out) in 2dClip.cuh.
+// This function just does the thrust reduction.
+static inline double reduce_cvt_energy(double* d_energy_buf, int nV)
+{
+    thrust::device_ptr<double> ptr(d_energy_buf);
+    return thrust::reduce(ptr, ptr + nV, 0.0, thrust::plus<double>());
+}
+
